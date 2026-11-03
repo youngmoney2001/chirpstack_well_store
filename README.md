@@ -33,7 +33,7 @@ version amont.
 | `chirpstack/src/storage/` | Accès PostgreSQL / SQLite / Redis, migrations |
 | `chirpstack/src/integration/` | Sorties MQTT, HTTP, Kafka, InfluxDB, AWS, … |
 | `chirpstack/src/api/` | gRPC + authentification / validation des droits |
-| `chirpstack/src/codec/` | Cayenne LPP et codec JavaScript (QuickJS) |
+| `chirpstack/src/codec/` | Cayenne LPP et codec JavaScript (QuickJS) — pool de runtimes phase 2.1 dans `codec/js/mod.rs` |
 | `lrwn/`, `lrwn-filters/`, `backend/` | Bibliothèques LoRaWAN, filtres, backend roaming |
 | `api/` | Définitions protobuf + clients générés (Go, Python, JS, …) |
 | `ui/` | Interface web React |
@@ -98,6 +98,36 @@ nécessitant Docker Compose) et les résultats mesurés.
 
 Le détail des modifications du noyau est dans
 [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md).
+
+## Optimisations déjà appliquées
+
+- **Phase 1** : filtrage des `rx_info` sans clone de messages protobuf,
+  suppression d'un appel dupliqué à `set_region_config()`, regex IFTTT compilée
+  une seule fois.
+- **Phase 2.1** : le codec JavaScript ne crée plus un runtime QuickJS par trame.
+  Un pool de runtimes par thread de blocking Tokio + un cache de scripts
+  compilés fait passer le micro-benchmark de ~5,3 ms à ~0,12 ms par décodage
+  (≈ ×40). Timeout par appel, isolation des entrées et reprise après erreur sont
+  conservés et testés.
+
+Nouvelles options `[codec.js]` (facultatives, valeurs par défaut indiquées) :
+
+```toml
+[codec.js]
+max_execution_time="100ms"
+cache_scripts=true        # false = comportement amont (runtime neuf par appel)
+max_cached_scripts=64     # scripts compilés conservés par worker
+```
+
+`cache_scripts=false` est à utiliser si un codec s'appuie sur la remise à zéro
+de variables déclarées hors de `decodeUplink` / `encodeDownlink`.
+
+Tests rapides :
+
+```bash
+cargo test --offline -p chirpstack codec::js:: -- --test-threads=1
+cargo test --offline -p chirpstack codec::js::bench -- --ignored --nocapture
+```
 
 ## Méthode de travail
 

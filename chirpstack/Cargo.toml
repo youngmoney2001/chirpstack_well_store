@@ -75,7 +75,7 @@
   # gRPC and Protobuf
   tonic-web.workspace = true
   tonic-reflection.workspace = true
-  tokio = { workspace = true, features = ["rt-multi-thread"] }
+  tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
   tokio-stream.workspace = true
   prost-types.workspace = true
   prost.workspace = true

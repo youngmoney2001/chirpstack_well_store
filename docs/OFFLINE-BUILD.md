@@ -69,6 +69,7 @@ cargo check  --offline -p chirpstack                     # ✅ ~2 min
 cargo build  --offline -p chirpstack                     # ✅ ~4 min 30
 cargo clippy --offline -p chirpstack                     # ✅ ~1 min 30
 cargo test   --offline -p chirpstack uplink::tests -- --test-threads=1
+cargo test   --offline -p chirpstack codec::js:: -- --test-threads=1
 ./target/debug/chirpstack --version                      # chirpstack 4.20.0
 cargo check --offline -p chirpstack --no-default-features --features sqlite
 ```
@@ -85,11 +86,15 @@ cargo check --offline -p chirpstack --no-default-features --features sqlite
 | `cargo clippy --offline -p chirpstack` | ✅ 0 erreur ; warnings préexistants de l'amont uniquement |
 | `cargo test --offline -p chirpstack --no-run` | ✅ binaire de test compilé (3 min 51) |
 | `cargo test --offline -p chirpstack uplink::tests -- --test-threads=1` | ✅ 3/3 tests des filtres d'uplink |
+| `cargo test --offline -p chirpstack codec::js:: -- --test-threads=1` | ✅ 16/16 tests du codec JS (8 amont + 8 pool), 1 benchmark ignoré |
+| `chirpstack --config <DIR> configfile` → parseur TOML | ✅ config générée valide (nouvelles options `[codec.js]`) |
 
-Les trois fichiers modifiés par nos optimisations ne produisent **aucun**
-warning ni erreur nouveaux. Les 215 autres tests (`class_a_test`, `otaa_test`,
-`relay_*`, …) compilent mais nécessitent les services Docker Compose pour
-s'exécuter.
+Les fichiers modifiés par nos optimisations ne produisent **aucun** warning ni
+erreur nouveaux. Les autres tests (`class_a_test`, `otaa_test`, `relay_*`, …)
+compilent mais nécessitent les services Docker Compose pour s'exécuter.
+`chirpstack/Cargo.toml` active en plus la feature Tokio `sync` (déjà présente
+transitivement), utilisée par le sémaphore du pool QuickJS ; `Cargo.lock` n'est
+pas modifié.
 
 ## Limites connues
 

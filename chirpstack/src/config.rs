@@ -440,12 +440,21 @@ pub struct Codec {
 pub struct CodecJs {
     #[serde(with = "humantime_serde")]
     pub max_execution_time: Duration,
+    /// Reuse QuickJS runtimes and already compiled codec scripts across calls
+    /// instead of creating a runtime for every single uplink/downlink.
+    /// Set to false to get the upstream behaviour (fresh runtime per call),
+    /// which is needed by codecs relying on top-level state being reset.
+    pub cache_scripts: bool,
+    /// Maximum number of compiled scripts kept per pooled worker.
+    pub max_cached_scripts: usize,
 }
 
 impl Default for CodecJs {
     fn default() -> Self {
         CodecJs {
             max_execution_time: Duration::from_millis(100),
+            cache_scripts: true,
+            max_cached_scripts: 64,
         }
     }
 }

@@ -654,6 +654,13 @@ pub fn run() {
     # Maximum execution time.
     max_execution_time="{{ codec.js.max_execution_time }}"
 
+    # Reuse QuickJS runtimes and compiled codec scripts between calls.
+    # Disable this if a codec relies on top-level state being reset on every call.
+    cache_scripts={{ codec.js.cache_scripts }}
+
+    # Maximum number of compiled scripts cached per worker.
+    max_cached_scripts={{ codec.js.max_cached_scripts }}
+
 
 # User authentication configuration.
 [user_authentication]
