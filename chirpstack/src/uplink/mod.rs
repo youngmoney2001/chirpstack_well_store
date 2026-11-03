@@ -485,3 +485,173 @@ fn filter_rx_info_by_public_only(uplink: &mut UplinkFrameSet) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Minimal valid UnconfirmedDataUp frame:
+    // MHDR + FHDR (DevAddr 4 + FCtrl 1 + FCnt 2) + FPort + MIC (4).
+    fn test_phy_payload() -> PhyPayload {
+        PhyPayload::from_slice(&[
+            0x40, 0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ])
+        .unwrap()
+    }
+
+    fn set_test_config() {
+        let mut conf = config::Configuration::default();
+        conf.regions = vec![config::Region {
+            id: "eu868".into(),
+            ..Default::default()
+        }];
+        config::set(conf);
+    }
+
+    fn gateway_id(i: u8) -> String {
+        format!("{:016x}", i)
+    }
+
+    /// Builds an uplink frame set with `n` gateways. `private` and `tenant_id`
+    /// describe what the maps contain for each gateway.
+    fn frame_set(n: u8, private: &[bool], tenant_ids: &[Option<Uuid>]) -> UplinkFrameSet {
+        let mut ufs = UplinkFrameSet {
+            uplink_set_id: Uuid::new_v4(),
+            dr: 0,
+            ch: 0,
+            phy_payload: test_phy_payload(),
+            tx_info: Default::default(),
+            rx_info_set: Vec::new(),
+            gateway_private_up_map: HashMap::new(),
+            gateway_private_down_map: HashMap::new(),
+            gateway_tenant_id_map: HashMap::new(),
+            gateway_downlink_priority_map: HashMap::new(),
+            region_common_name: CommonName::EU868,
+            region_config_id: "eu868".into(),
+            roaming_meta_data: None,
+        };
+
+        for i in 0..n {
+            let id = gateway_id(i);
+            let gw_id = EUI64::from_str(&id).unwrap();
+            ufs.rx_info_set.push(gw::UplinkRxInfo {
+                gateway_id: id,
+                ..Default::default()
+            });
+            ufs.gateway_private_up_map
+                .insert(gw_id, *private.get(i as usize).unwrap_or(&true));
+            if let Some(Some(t)) = tenant_ids.get(i as usize) {
+                ufs.gateway_tenant_id_map.insert(gw_id, *t);
+            }
+        }
+
+        ufs
+    }
+
+    /// The original (upstream v4.20.0) implementation, used as a reference:
+    /// it cloned every retained UplinkRxInfo into a new Vec.
+    fn tenant_filter_reference(tenant_id: Uuid, ufs: &UplinkFrameSet) -> Vec<String> {
+        let mut out = Vec::new();
+        for rx_info in &ufs.rx_info_set {
+            let gw_id = EUI64::from_str(&rx_info.gateway_id).unwrap();
+            if !(ufs
+                .gateway_private_up_map
+                .get(&gw_id)
+                .cloned()
+                .unwrap_or(true)
+                || false)
+                || ufs
+                    .gateway_tenant_id_map
+                    .get(&gw_id)
+                    .cloned()
+                    .unwrap_or_else(Uuid::new_v4)
+                    == tenant_id
+            {
+                out.push(rx_info.gateway_id.clone());
+            }
+        }
+        out
+    }
+
+    fn public_filter_reference(ufs: &UplinkFrameSet) -> Vec<String> {
+        let mut out = Vec::new();
+        for rx_info in &ufs.rx_info_set {
+            let gw_id = EUI64::from_str(&rx_info.gateway_id).unwrap();
+            if !(*ufs.gateway_private_up_map.get(&gw_id).unwrap()) {
+                out.push(rx_info.gateway_id.clone());
+            }
+        }
+        out
+    }
+
+    fn ids(ufs: &UplinkFrameSet) -> Vec<String> {
+        ufs.rx_info_set
+            .iter()
+            .map(|v| v.gateway_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn tenant_filter_matches_upstream_behaviour() {
+        set_test_config();
+        let tenant = Uuid::new_v4();
+        let other = Uuid::new_v4();
+
+        let cases: Vec<(Vec<bool>, Vec<Option<Uuid>>)> = vec![
+            (vec![false], vec![Some(tenant)]),
+            (vec![false, true], vec![Some(tenant), Some(other)]),
+            (vec![true, true], vec![Some(tenant), None]),
+            (vec![false, false], vec![None, Some(other)]),
+            (
+                vec![false, false, true, false],
+                vec![None, Some(tenant), Some(tenant), Some(other)],
+            ),
+        ];
+
+        for (private, tenants) in cases {
+            let n = private.len() as u8;
+            let reference = {
+                let ufs = frame_set(n, &private, &tenants);
+                tenant_filter_reference(tenant, &ufs)
+            };
+
+            let mut ufs = frame_set(n, &private, &tenants);
+            let result = filter_rx_info_by_tenant_id(tenant, &mut ufs);
+
+            if reference.is_empty() {
+                assert!(result.is_err(), "empty filtered set must be an error");
+            } else {
+                assert!(result.is_ok(), "unexpected error: {:?}", result);
+                assert_eq!(ids(&ufs), reference, "filtered gateway ids differ");
+            }
+        }
+    }
+
+    #[test]
+    fn public_filter_matches_upstream_behaviour() {
+        let private = vec![false, true, false, true];
+        let tenants: Vec<Option<Uuid>> = vec![None; 4];
+        let reference = {
+            let ufs = frame_set(4, &private, &tenants);
+            public_filter_reference(&ufs)
+        };
+
+        let mut ufs = frame_set(4, &private, &tenants);
+        assert!(filter_rx_info_by_public_only(&mut ufs).is_ok());
+        assert_eq!(ids(&ufs), reference);
+    }
+
+    #[test]
+    fn malformed_gateway_id_leaves_rx_info_set_untouched() {
+        set_test_config();
+        let mut ufs = frame_set(2, &[false, false], &[None, None]);
+        ufs.rx_info_set[0].gateway_id = "not-an-eui64".into();
+        let before = ids(&ufs);
+
+        assert!(filter_rx_info_by_tenant_id(Uuid::new_v4(), &mut ufs).is_err());
+        assert_eq!(ids(&ufs), before, "set must not be modified on error");
+
+        assert!(filter_rx_info_by_public_only(&mut ufs).is_err());
+        assert_eq!(ids(&ufs), before, "set must not be modified on error");
+    }
+}

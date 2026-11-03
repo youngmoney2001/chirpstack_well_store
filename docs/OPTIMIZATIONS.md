@@ -13,26 +13,31 @@ vérification) pour rester rebasable sur les futures versions.
 repackagés sur `registry.npmjs.org` via `scripts/install-rust-toolchain.sh`.
 Le `rust-toolchain.toml` (1.89.0) n'est lu que par `rustup`, donc ignoré ici.
 
-**Limite restante** : `crates.io` (`index.crates.io`, `static.crates.io`) est
-inaccessible → `cargo check` s'arrête sur `no matching package named 'aes' found`
-en mode `--offline`, et part en timeouts réseau sinon. `cargo build` / `make test`
-nécessitent donc un `vendor/` généré sur une machine connectée, ou l'ouverture
-de l'accès à crates.io dans le bac à sable.
+**`crates.io` reste inaccessible**, mais ce n'est plus un bloqueur : un snapshot
+`cargo vendor` des 608 crates de `Cargo.lock` est produit par un runner GitHub
+Actions (qui a accès à crates.io), rapatrié via `git` et extrait dans
+`~/.cache/vendor`. Les dépendances natives (`protoc`, `cmake`, `libpq`,
+`pkg-config`) viennent de PyPI / npm / codeload. Voir
+[`docs/OFFLINE-BUILD.md`](OFFLINE-BUILD.md) pour la procédure complète.
 
-Pour chaque patch, les vérifications réalisables ici sont :
+Conséquence : **`cargo check`, `cargo build` et `cargo clippy` tournent
+réellement ici** en `--offline`, avec le workspace complet. Pour chaque patch :
 
 - relecture + `diff` contre l'amont ;
 - `rustfmt --edition 2024 --config skip_children=true --check` (vrai parseur Rust) ;
-- `cargo metadata --no-deps --offline` (workspace et manifestes valides) ;
+- `cargo check --offline -p chirpstack` (postgres **et** sqlite) — compilation
+  typée de tout le noyau ;
+- `cargo build --offline -p chirpstack` + exécution du binaire ;
+- `cargo clippy --offline -p chirpstack` ;
 - compilation par `rustc` d'un harnais autonome qui reproduit les fonctions
-  patchées avec des types factices : valide le **borrow checker**, l'inférence
-  de types et l'équivalence comportementale avec l'algorithme amont
+  patchées avec des types factices : **borrow checker**, inférence de types et
+  équivalence comportementale avec l'algorithme amont
   (`scripts/verify_uplink_filters.rs`) ;
 - analyse syntaxique `scripts/check_rust_syntax.py` en repli.
 
-La confirmation définitive (`cargo build -p chirpstack`, `cargo clippy`,
-`make test`) reste à faire sur un poste avec crates.io + les services Docker
-Compose.
+Seul `make test` reste à faire sur un poste avec les services Docker Compose
+(PostgreSQL, Redis, Mosquitto…). L'UI est un placeholder `ui/build/index.html`
+(voir `docs/OFFLINE-BUILD.md`).
 
 ---
 
@@ -96,24 +101,31 @@ amorti.
 | --- | --- |
 | `diff -ru` contre l'amont, fichiers Rust | ✅ 3 fichiers modifiés, patches ciblés (cf. §1.1–1.3) |
 | `rustfmt --edition 2024 --check` sur les 3 fichiers | ✅ conformes (identique à l'amont) |
-| `cargo metadata --no-deps --offline` | ✅ workspace valide, 6 crates : `chirpstack`, `backend`, `chirpstack_api`, `lrwn`, `chirpstack_integration`, `lrwn_filters` |
+| `cargo metadata --offline` | ✅ 609 packages résolus depuis `~/.cache/vendor` |
 | `rustc --edition 2024` du harnais `scripts/verify_uplink_filters.rs` | ✅ compile (borrow checker + inférence OK) et **résultats identiques à l'algorithme amont** sur 6 jeux de passerelles + cas d'erreur |
 | Analyse syntaxique tree-sitter (`scripts/check_rust_syntax.py`) | ✅ 0 erreur sur les 3 fichiers |
-| `cargo check -p chirpstack` | ❌ bloqué : `no matching package named 'aes' found` (`--offline`) / timeouts TLS vers `index.crates.io` |
-| `cargo build`, `cargo clippy`, `make test` | ⏳ à faire sur un poste avec crates.io + Docker Compose ; `class_a_test`, `class_a_pr_test`, `otaa_test`, `otaa_pr_test` couvrent indirectement les deux filtres |
-| Tests unitaires in-crate dédiés aux deux filtres | ⏳ à ajouter dès que les dépendances sont disponibles (ils nécessitent un `UplinkFrameSet`, donc un `PhyPayload` factice) |
+| `cargo check --offline -p chirpstack` (postgres, défaut) | ✅ 2 min 13, **0 erreur** |
+| `cargo check --offline -p chirpstack --no-default-features --features sqlite` | ✅ 1 min 02, **0 erreur** |
+| `cargo build --offline -p chirpstack` | ✅ 4 min 30 ; `./target/debug/chirpstack --version` → `chirpstack 4.20.0` |
+| `cargo clippy --offline -p chirpstack` | ✅ 0 erreur ; warnings préexistants de l'amont uniquement, **aucun dans nos 3 fichiers** |
+| Tests unitaires in-crate `uplink::tests` (3 tests) | ✅ 3/3 : équivalence avec l'algorithme amont (tenant + public) et non-modification du set en cas d'identifiant invalide |
+| `make test` (215 autres tests : class_a, otaa, …) | ⏳ nécessite PostgreSQL / Redis / Mosquitto via Docker Compose, indisponible ici |
 
-Commandes de vérification reproductibles :
+Commandes de vérification reproductibles (voir [`OFFLINE-BUILD.md`](OFFLINE-BUILD.md)) :
 
 ```bash
 bash scripts/install-rust-toolchain.sh        # si le toolchain a disparu
-cargo metadata --no-deps --offline
+bash scripts/install-build-deps.sh            # protoc, cmake, libpq, pkg-config, ui/build
+bash scripts/fetch-vendor-crates.sh           # 608 crates -> ~/.cache/vendor
+export CARGO_HOME="$HOME/.cache/cargo-home"
+
 rustfmt --edition 2024 --config skip_children=true --check \
   chirpstack/src/uplink/mod.rs chirpstack/src/uplink/data.rs \
   chirpstack/src/api/application.rs
+cargo check --offline -p chirpstack
+cargo clippy --offline -p chirpstack
+cargo test --offline -p chirpstack uplink::tests -- --test-threads=1
 rustc --edition 2024 -o /tmp/verify scripts/verify_uplink_filters.rs && /tmp/verify
-python3 -m venv /tmp/tsvenv && /tmp/tsvenv/bin/pip install -q tree-sitter tree-sitter-rust
-/tmp/tsvenv/bin/python scripts/check_rust_syntax.py chirpstack/src/uplink/mod.rs
 ```
 
 ---

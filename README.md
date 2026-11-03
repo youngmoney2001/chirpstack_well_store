@@ -38,8 +38,10 @@ version amont.
 | `api/` | Définitions protobuf + clients générés (Go, Python, JS, …) |
 | `ui/` | Interface web React |
 | `docs/OPTIMIZATIONS.md` | **Audit, modifications appliquées et feuille de route** |
+| `docs/OFFLINE-BUILD.md` | Build hors ligne (vendor via GitHub Actions, dépendances natives, résultats) |
 | `docs/upstream/` | README amont et CI amont archivés |
-| `scripts/` | Installation du toolchain, contrôle syntaxique, harnais de vérification hors ligne |
+| `.github/workflows/vendor-crates.yml` | Génère le snapshot `cargo vendor` hors ligne |
+| `scripts/` | Installation toolchain + dépendances natives, récupération du vendor, contrôles |
 
 Le crate serveur représente à lui seul ~88 500 lignes de Rust.
 
@@ -75,22 +77,27 @@ cargo --version && rustc --version
 > proxy `rustup`. Ici on appelle les binaires réels directement, donc l'épingle
 > est ignorée. Sur une machine normale, préférer `rustup toolchain install 1.89.0`.
 
-⚠️ **`crates.io` reste bloqué** (`index.crates.io` / `static.crates.io` inaccessibles) :
-`cargo build`, `cargo check` et `make test` ne peuvent donc pas télécharger les
-~500 dépendances du workspace. Pour compiler réellement, il faut soit un accès
-réseau à crates.io, soit un répertoire `vendor/` produit par `cargo vendor` sur
-une machine connectée.
-
-En attendant, ces vérifications fonctionnent **hors ligne** :
+`crates.io` reste **inaccessible** depuis le sandbox (filtrage plateforme, non
+modifiable ici), mais la compilation complète fonctionne grâce à un snapshot
+`cargo vendor` produit par GitHub Actions et rapatrié via `git` :
 
 ```bash
-cargo metadata --no-deps --offline                     # workspace valide (6 crates)
-rustfmt --edition 2024 --config skip_children=true --check chirpstack/src/uplink/mod.rs
-rustc --edition 2024 -o /tmp/verify scripts/verify_uplink_filters.rs && /tmp/verify
-python3 scripts/check_rust_syntax.py chirpstack/src/uplink/mod.rs
+bash scripts/install-rust-toolchain.sh   # toolchain
+bash scripts/install-build-deps.sh       # protoc, cmake, libpq, pkg-config, ui/build
+bash scripts/fetch-vendor-crates.sh      # 608 crates -> ~/.cache/vendor
+
+export CARGO_HOME="$HOME/.cache/cargo-home"
+cargo check  --offline -p chirpstack     # ✅ 0 erreur
+cargo build  --offline -p chirpstack     # ✅ binaire target/debug/chirpstack
+cargo clippy --offline -p chirpstack     # ✅ 0 erreur
 ```
 
-Le détail par modification est dans [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md).
+Voir [`docs/OFFLINE-BUILD.md`](docs/OFFLINE-BUILD.md) pour l'architecture
+détaillée, le déclenchement du workflow, les limites (UI placeholder, tests
+nécessitant Docker Compose) et les résultats mesurés.
+
+Le détail des modifications du noyau est dans
+[`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md).
 
 ## Méthode de travail
 
