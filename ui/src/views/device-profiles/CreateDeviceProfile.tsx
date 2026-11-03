@@ -1,0 +1,122 @@
+import { Link, useNavigate } from "react-router";
+
+import { Space, Breadcrumb, Card } from "antd";
+
+import { MacVersion, RegParamsRevision } from "@chirpstack/chirpstack-api-grpc-web/common/common_pb";
+import type { CreateDeviceProfileResponse } from "@chirpstack/chirpstack-api-grpc-web/api/device_profile_pb";
+import {
+  DeviceProfile,
+  CreateDeviceProfileRequest,
+  AppLayerParams,
+} from "@chirpstack/chirpstack-api-grpc-web/api/device_profile_pb";
+
+import type { Tenant } from "@chirpstack/chirpstack-api-grpc-web/api/tenant_pb";
+
+import DeviceProfileForm from "./DeviceProfileForm";
+import DeviceProfileStore from "../../stores/DeviceProfileStore";
+import { useTitle } from "../helpers";
+import PageHeader from "../../components/PageHeader";
+
+interface IProps {
+  tenant: Tenant;
+}
+
+function CreateDeviceProfile(props: IProps) {
+  const navigate = useNavigate();
+  useTitle("Tenants", props.tenant.getName(), "Device profiles", "Add");
+
+  const onFinish = (obj: DeviceProfile) => {
+    obj.setTenantId(props.tenant.getId());
+
+    const req = new CreateDeviceProfileRequest();
+    req.setDeviceProfile(obj);
+
+    DeviceProfileStore.create(req, (_resp: CreateDeviceProfileResponse) => {
+      navigate(`/tenants/${props.tenant.getId()}/device-profiles`);
+    });
+  };
+
+  const codecScript = `/**
+ * Decode uplink function
+ * 
+ * @param {object} input
+ * @param {number[]} input.bytes Byte array containing the uplink payload, e.g. [255, 230, 255, 0]
+ * @param {number} input.fPort Uplink fPort.
+ * @param {Record<string, string>} input.variables Object containing the configured device variables.
+ * 
+ * @returns {{data: object, errors?: string[], warnings?: string[]}}
+ * An object containing:
+ * - data: Object representing the decoded payload.
+ * - errors: An array of errors (optional).
+ * - warnings: An array of warnings (optional).
+ */
+function decodeUplink(input) {
+  return {
+    data: {
+      temp: 22.5,
+    }
+  };
+}
+
+/**
+ * Encode downlink function.
+ * 
+ * @param {object} input
+ * @param {object} input.data Object representing the payload that must be encoded.
+ * @param {Record<string, string>} input.variables Object containing the configured device variables.
+ * 
+ * @returns {{bytes: number[], fPort?: number, errors?: string[], warnings?: string[]}}
+ * An object containing:
+ * - bytes: Byte array containing the downlink payload.
+ * - fPort: The downlink LoRaWAN fPort. (falls back to provided fPort)
+ * - errors: An array of errors (optional).
+ * - warnings: An array of warnings (optional).
+ */
+function encodeDownlink(input) {
+  return {
+    fPort: 10,
+    bytes: [225, 230, 255, 0],
+  };
+}
+`;
+
+  const deviceProfile = new DeviceProfile();
+  deviceProfile.setPayloadCodecScript(codecScript);
+  deviceProfile.setSupportsOtaa(true);
+  deviceProfile.setUplinkInterval(3600);
+  deviceProfile.setDeviceStatusReqInterval(1);
+  deviceProfile.setAdrAlgorithmId("default");
+  deviceProfile.setMacVersion(MacVersion.LORAWAN_1_0_3);
+  deviceProfile.setRegParamsRevision(RegParamsRevision.A);
+  deviceProfile.setFlushQueueOnActivate(true);
+  deviceProfile.setAutoDetectMeasurements(true);
+
+  const appLayer = new AppLayerParams();
+  appLayer.setTs003FPort(202);
+  appLayer.setTs004FPort(201);
+  appLayer.setTs005FPort(200);
+  deviceProfile.setAppLayerParams(appLayer);
+
+  return (
+    <Space orientation="vertical" style={{ width: "100%" }} size="large">
+      <PageHeader
+        breadcrumbRender={() => (
+          <Breadcrumb
+            items={[
+              { title: "Tenants" },
+              { title: <Link to={`/tenants/${props.tenant.getId()}`}>{props.tenant.getName()}</Link> },
+              { title: <Link to={`/tenants/${props.tenant.getId()}/device-profiles`}>Device profiles</Link> },
+              { title: "Add" },
+            ]}
+          />
+        )}
+        title="Add device profile"
+      />
+      <Card>
+        <DeviceProfileForm initialValues={deviceProfile} onFinish={onFinish} />
+      </Card>
+    </Space>
+  );
+}
+
+export default CreateDeviceProfile;

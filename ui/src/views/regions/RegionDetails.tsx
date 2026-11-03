@@ -1,0 +1,139 @@
+import { useState, useEffect } from "react";
+import { Link } from "react-router";
+import { useParams } from "react-router";
+
+import { Space, Breadcrumb, Card, Row, Col, List, Typography } from "antd";
+import ReactMarkdown from "react-markdown";
+
+import { Region } from "@chirpstack/chirpstack-api-grpc-web/common/common_pb";
+import type { GetRegionResponse } from "@chirpstack/chirpstack-api-grpc-web/api/internal_pb";
+import { GetRegionRequest } from "@chirpstack/chirpstack-api-grpc-web/api/internal_pb";
+
+import { getEnumName } from "../helpers";
+import InternalStore from "../../stores/InternalStore";
+import { useTitle } from "../helpers";
+import PageHeader from "../../components/PageHeader";
+
+function RegionDetails() {
+  const [region, setRegion] = useState<GetRegionResponse | undefined>(undefined);
+  const { id } = useParams();
+  useTitle("Network Server", "Regions", region?.getDescription());
+
+  useEffect(() => {
+    const req = new GetRegionRequest();
+    req.setId(id!);
+
+    InternalStore.getRegion(req, (resp: GetRegionResponse) => {
+      setRegion(resp);
+    });
+  }, [id]);
+
+  if (region === undefined) {
+    return null;
+  }
+
+  return (
+    <Space orientation="vertical" style={{ width: "100%" }} size="large">
+      <PageHeader
+        breadcrumbRender={() => (
+          <Breadcrumb
+            items={[
+              { title: "Network Server" },
+              { title: <Link to="/regions">Regions</Link> },
+              { title: region.getDescription() },
+            ]}
+          />
+        )}
+        title={region.getDescription()}
+        subTitle={`id: ${id}, common-name: ${getEnumName(Region, region.getRegion())}`}
+      />
+      {region.getUserInfo() !== "" && (
+        <Card>
+          <ReactMarkdown>{region.getUserInfo()}</ReactMarkdown>
+        </Card>
+      )}
+      <Row gutter={24}>
+        <Col span={12}>
+          <Space orientation="vertical" style={{ width: "100%" }} size="large">
+            <Card title="Uplink channels">
+              <List
+                itemLayout="horizontal"
+                dataSource={region.getUplinkChannelsList()}
+                renderItem={item => (
+                  <List.Item>
+                    <List.Item.Meta
+                      title={`${item.getFrequency()} Hz`}
+                      description={item
+                        .getDataRatesList()
+                        .map(v => `DR${v}`)
+                        .join(", ")}
+                    />
+                  </List.Item>
+                )}
+              />
+            </Card>
+          </Space>
+        </Col>
+        <Col span={12}>
+          <Space orientation="vertical" style={{ width: "100%" }} size="large">
+            <Card title="Downlink">
+              <List
+                dataSource={[
+                  ["RX1 delay", `${region.getRx1Delay()} sec`],
+                  ["RX1 DR offset", region.getRx1DrOffset()],
+                  ["RX2 DR", region.getRx2Dr()],
+                  ["RX2 frequency", `${region.getRx2Frequency()} Hz`],
+                ]}
+                renderItem={item => (
+                  <List.Item>
+                    <Typography.Text
+                      strong
+                      style={{
+                        width: "175px",
+                        display: "block",
+                        float: "left",
+                      }}
+                    >
+                      {item[0]}:
+                    </Typography.Text>{" "}
+                    {item[1]}
+                  </List.Item>
+                )}
+              />
+            </Card>
+            <Card title="Class-B">
+              <List
+                dataSource={[
+                  ["Ping-slot DR", region.getClassBPingSlotDr()],
+                  [
+                    "Ping-slot frequency",
+                    region.getClassBPingSlotFrequency() === 0
+                      ? "default frequency or frequency hopping"
+                      : `${region.getClassBPingSlotFrequency()} Hz`,
+                  ],
+                ]}
+                renderItem={item => (
+                  <List.Item>
+                    <Typography.Text
+                      strong
+                      style={{
+                        width: "175px",
+                        display: "block",
+                        float: "left",
+                      }}
+                    >
+                      {item[0]}:
+                    </Typography.Text>{" "}
+                    {item[1]}
+                  </List.Item>
+                )}
+              />
+            </Card>
+          </Space>
+        </Col>
+      </Row>
+    </Space>
+  );
+}
+
+export default RegionDetails;

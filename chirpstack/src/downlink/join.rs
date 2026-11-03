@@ -1,0 +1,694 @@
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use rand::RngExt;
+use tracing::{Instrument, Level, span, trace};
+
+use lrwn::{EUI64, PhyPayload};
+
+use super::helpers;
+use crate::api::helpers::FromProto;
+use crate::gateway::backend::send_downlink;
+use crate::storage::{device, downlink_frame, tenant};
+use crate::uplink::{RelayContext, UplinkFrameSet};
+use crate::{config, region, sensitivity};
+use chirpstack_api::{gw, internal};
+
+pub struct JoinAccept<'a> {
+    uplink_frame_set: &'a UplinkFrameSet,
+    relay_context: Option<&'a RelayContext>,
+    tenant: &'a tenant::Tenant,
+    device: &'a mut device::Device,
+    join_accept: &'a PhyPayload,
+    network_conf: config::RegionNetwork,
+    region_conf: Arc<Box<dyn lrwn::region::Region + Sync + Send>>,
+
+    downlink_frame: chirpstack_api::gw::DownlinkFrame,
+    downlink_gateway: Option<internal::DownlinkGateway>,
+}
+
+impl JoinAccept<'_> {
+    pub async fn handle(
+        ufs: &UplinkFrameSet,
+        tenant: &tenant::Tenant,
+        device: &mut device::Device,
+        join_accept: &PhyPayload,
+    ) -> Result<()> {
+        let downlink_id: u32 = rand::rng().random();
+        let span = span!(Level::INFO, "join_accept", downlink_id = downlink_id);
+
+        let fut = JoinAccept::_handle(downlink_id, ufs, tenant, device, join_accept);
+        fut.instrument(span).await
+    }
+
+    pub async fn handle_relayed(
+        relay_ctx: &RelayContext,
+        ufs: &UplinkFrameSet,
+        tenant: &tenant::Tenant,
+        device: &mut device::Device,
+        join_accept: &PhyPayload,
+    ) -> Result<()> {
+        let downlink_id: u32 = rand::rng().random();
+        let span = span!(
+            Level::INFO,
+            "join_accept_relayed",
+            downlink_id = downlink_id
+        );
+
+        let fut =
+            JoinAccept::_handle_relayed(downlink_id, relay_ctx, ufs, tenant, device, join_accept);
+        fut.instrument(span).await
+    }
+
+    async fn _handle(
+        downlink_id: u32,
+        ufs: &UplinkFrameSet,
+        tenant: &tenant::Tenant,
+        device: &mut device::Device,
+        join_accept: &PhyPayload,
+    ) -> Result<()> {
+        let mut ctx = JoinAccept {
+            uplink_frame_set: ufs,
+            relay_context: None,
+            tenant,
+            device,
+            join_accept,
+            network_conf: config::get_region_network(&ufs.region_config_id)?,
+            region_conf: region::get(&ufs.region_config_id)?,
+
+            downlink_frame: chirpstack_api::gw::DownlinkFrame {
+                downlink_id,
+                ..Default::default()
+            },
+            downlink_gateway: None,
+        };
+
+        ctx.set_device_gateway_rx_info()?;
+        ctx.select_downlink_gateway()?;
+        ctx.set_tx_info()?;
+        ctx.set_downlink_frame()?;
+        ctx.save_downlink_frame().await?;
+        ctx.send_join_accept_response().await?;
+
+        Ok(())
+    }
+
+    async fn _handle_relayed(
+        downlink_id: u32,
+        relay_ctx: &RelayContext,
+        ufs: &UplinkFrameSet,
+        tenant: &tenant::Tenant,
+        device: &mut device::Device,
+        join_accept: &PhyPayload,
+    ) -> Result<()> {
+        let mut ctx = JoinAccept {
+            uplink_frame_set: ufs,
+            relay_context: Some(relay_ctx),
+            tenant,
+            device,
+            join_accept,
+            network_conf: config::get_region_network(&ufs.region_config_id)?,
+            region_conf: region::get(&ufs.region_config_id)?,
+
+            downlink_frame: chirpstack_api::gw::DownlinkFrame {
+                downlink_id,
+                ..Default::default()
+            },
+            downlink_gateway: None,
+        };
+
+        ctx.set_device_gateway_rx_info()?;
+        ctx.select_downlink_gateway()?;
+        ctx.set_tx_info_relayed()?;
+        ctx.set_downlink_frame_relayed()?;
+        ctx.send_join_accept_response().await?;
+        ctx.save_downlink_frame_relayed().await?;
+
+        Ok(())
+    }
+
+    fn set_device_gateway_rx_info(&mut self) -> Result<()> {
+        trace!("Set device-gateway rx-info");
+        let ds = self.device.get_device_session_mut()?;
+
+        let history = internal::GatewayRxInfoHistory {
+            dr: self.uplink_frame_set.dr as u32,
+            items: self
+                .uplink_frame_set
+                .rx_info_set
+                .iter()
+                .map(|rx_info| {
+                    let gw_id = EUI64::from_str(&rx_info.gateway_id).unwrap_or_default();
+
+                    internal::GatewayRxInfoHistoryItem {
+                        gateway_id: gw_id.to_vec(),
+                        rssi: rx_info.rssi,
+                        lora_snr: rx_info.snr,
+                        antenna: rx_info.antenna,
+                        board: rx_info.board,
+                        context: rx_info.context.clone(),
+                        is_private_up: self
+                            .uplink_frame_set
+                            .gateway_private_up_map
+                            .get(&gw_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                        is_private_down: self
+                            .uplink_frame_set
+                            .gateway_private_down_map
+                            .get(&gw_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                        tenant_id: self
+                            .uplink_frame_set
+                            .gateway_tenant_id_map
+                            .get(&gw_id)
+                            .map(|v| v.into_bytes().to_vec())
+                            .unwrap_or_default(),
+                        gateway_downlink_priority: self
+                            .uplink_frame_set
+                            .gateway_downlink_priority_map
+                            .get(&gw_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    }
+                })
+                .collect(),
+        };
+        ds.append_gateway_rx_info_history(
+            history,
+            config::get().gateway.device_gateway_mapping_history_uplinks,
+        );
+
+        Ok(())
+    }
+
+    fn select_downlink_gateway(&mut self) -> Result<()> {
+        trace!("Select downlink gateway");
+        let ds = self.device.device_session.as_ref().unwrap();
+
+        let gw_down = helpers::select_downlink_gateway(
+            Some(self.tenant.id.into()),
+            &self.uplink_frame_set.region_config_id,
+            self.network_conf.gateway_prefer_min_margin,
+            &ds.gateway_rx_info_history,
+            true,
+        )?;
+
+        self.downlink_frame.gateway_id = hex::encode(&gw_down.gateway_id);
+        self.downlink_gateway = Some(gw_down);
+
+        Ok(())
+    }
+
+    fn set_tx_info(&mut self) -> Result<()> {
+        trace!("Setting tx-info");
+
+        let mut prefer_rx2_over_rx1 = self._prefer_rx2_dr()?;
+        if self.network_conf.rx2_prefer_on_link_budget {
+            prefer_rx2_over_rx1 = prefer_rx2_over_rx1 || self._prefer_rx2_link_budget()?;
+        }
+
+        // RX2 is prefered and the RX window is set to automatic.
+        if prefer_rx2_over_rx1 && self.network_conf.rx_window == 0 {
+            // RX2
+            self.set_tx_info_for_rx2()?;
+
+            // RX1
+            self.set_tx_info_for_rx1()?;
+        } else {
+            // RX1
+            if [0, 1].contains(&self.network_conf.rx_window) {
+                self.set_tx_info_for_rx1()?;
+            }
+
+            // RX2
+            if [0, 2].contains(&self.network_conf.rx_window) {
+                self.set_tx_info_for_rx2()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn set_tx_info_relayed(&mut self) -> Result<()> {
+        trace!("Setting tx-info for relay");
+
+        let mut prefer_rx2_over_rx1 = self._prefer_rx2_dr()?;
+        if self.network_conf.rx2_prefer_on_link_budget {
+            prefer_rx2_over_rx1 = prefer_rx2_over_rx1 || self._prefer_rx2_link_budget()?;
+        }
+
+        // RX2 is prefered and the RX window is set to automatic.
+        if prefer_rx2_over_rx1 && self.network_conf.rx_window == 0 {
+            // RX2
+            self.set_tx_info_for_rx2_relayed()?;
+
+            // RX1
+            self.set_tx_info_for_rx1_relayed()?;
+        } else {
+            // RX1
+            if [0, 1].contains(&self.network_conf.rx_window) {
+                self.set_tx_info_for_rx1_relayed()?;
+            }
+
+            // RX2
+            if [0, 2].contains(&self.network_conf.rx_window) {
+                self.set_tx_info_for_rx2_relayed()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn set_tx_info_for_rx1(&mut self) -> Result<()> {
+        trace!("Setting tx-info for RX1");
+        let gw_down = self.downlink_gateway.as_ref().unwrap();
+
+        let mut tx_info = chirpstack_api::gw::DownlinkTxInfo {
+            board: gw_down.board,
+            antenna: gw_down.antenna,
+            context: gw_down.context.clone(),
+            ..Default::default()
+        };
+
+        // get RX1 DR.
+        let rx1_dr_index = self
+            .region_conf
+            .get_rx1_data_rate_index(self.uplink_frame_set.dr, 0)?;
+        let rx1_dr = self.region_conf.get_data_rate(false, rx1_dr_index)?;
+
+        // set DR to tx_info.
+        helpers::set_tx_info_data_rate(&mut tx_info, &rx1_dr)?;
+
+        // set frequency
+        tx_info.frequency = self
+            .region_conf
+            .get_rx1_frequency_for_uplink_frequency(self.uplink_frame_set.tx_info.frequency)?;
+
+        // set tx power
+        if self.network_conf.downlink_tx_power != -1 {
+            tx_info.power = self.network_conf.downlink_tx_power;
+        } else {
+            tx_info.power = self
+                .region_conf
+                .get_downlink_tx_power_eirp(tx_info.frequency) as i32;
+        }
+
+        // Set timestamp.
+        tx_info.timing = Some(gw::Timing {
+            parameters: Some(gw::timing::Parameters::Delay(gw::DelayTimingInfo {
+                delay: Some(pbjson_types::Duration::from(
+                    self.region_conf.get_defaults().join_accept_delay1,
+                )),
+            })),
+        });
+
+        // set downlink item
+        self.downlink_frame
+            .items
+            .push(chirpstack_api::gw::DownlinkFrameItem {
+                tx_info: Some(tx_info),
+                ..Default::default()
+            });
+
+        Ok(())
+    }
+
+    fn set_tx_info_for_rx1_relayed(&mut self) -> Result<()> {
+        trace!("Setting relay tx-info for RX1");
+
+        let gw_down = self.downlink_gateway.as_ref().unwrap();
+        let relay_ctx = self.relay_context.unwrap();
+        let relay_ds = relay_ctx.device.get_device_session()?;
+
+        let mut tx_info = chirpstack_api::gw::DownlinkTxInfo {
+            board: gw_down.board,
+            antenna: gw_down.antenna,
+            context: gw_down.context.clone(),
+            ..Default::default()
+        };
+
+        // Get RX1 DR offset.
+        let rx1_dr_offset = relay_ds.rx1_dr_offset as usize;
+
+        // get RX1 DR.
+        let rx1_dr_index = self
+            .region_conf
+            .get_rx1_data_rate_index(self.uplink_frame_set.dr, rx1_dr_offset)?;
+        let rx1_dr = self.region_conf.get_data_rate(false, rx1_dr_index)?;
+
+        // set DR to tx_info.
+        helpers::set_tx_info_data_rate(&mut tx_info, &rx1_dr)?;
+
+        // set frequency
+        tx_info.frequency = self
+            .region_conf
+            .get_rx1_frequency_for_uplink_frequency(self.uplink_frame_set.tx_info.frequency)?;
+
+        // set tx power
+        if self.network_conf.downlink_tx_power != -1 {
+            tx_info.power = self.network_conf.downlink_tx_power;
+        } else {
+            tx_info.power = self
+                .region_conf
+                .get_downlink_tx_power_eirp(tx_info.frequency) as i32;
+        }
+
+        // Set timestamp.
+        let delay = if relay_ds.rx1_delay > 0 {
+            Duration::from_secs(relay_ds.rx1_delay as u64)
+        } else {
+            self.region_conf.get_defaults().rx1_delay
+        };
+        tx_info.timing = Some(gw::Timing {
+            parameters: Some(gw::timing::Parameters::Delay(gw::DelayTimingInfo {
+                delay: Some(pbjson_types::Duration::from(delay)),
+            })),
+        });
+
+        // set downlink item
+        self.downlink_frame
+            .items
+            .push(chirpstack_api::gw::DownlinkFrameItem {
+                tx_info: Some(tx_info),
+                ..Default::default()
+            });
+
+        Ok(())
+    }
+
+    fn set_tx_info_for_rx2(&mut self) -> Result<()> {
+        trace!("Setting tx-info for RX2");
+        let gw_down = self.downlink_gateway.as_ref().unwrap();
+
+        // Get frequency.
+        let frequency = self.region_conf.get_defaults().rx2_frequency;
+
+        let mut tx_info = chirpstack_api::gw::DownlinkTxInfo {
+            board: gw_down.board,
+            antenna: gw_down.antenna,
+            context: gw_down.context.clone(),
+            frequency,
+            ..Default::default()
+        };
+
+        // get RX2 DR
+        let rx2_dr_index = self.region_conf.get_defaults().rx2_dr;
+        let rx2_dr = self.region_conf.get_data_rate(false, rx2_dr_index)?;
+
+        // set DR to tx_info
+        helpers::set_tx_info_data_rate(&mut tx_info, &rx2_dr)?;
+
+        // set tx-power
+        if self.network_conf.downlink_tx_power != -1 {
+            tx_info.power = self.network_conf.downlink_tx_power;
+        } else {
+            tx_info.power = self
+                .region_conf
+                .get_downlink_tx_power_eirp(tx_info.frequency) as i32;
+        }
+
+        // Set timestamp.
+        tx_info.timing = Some(gw::Timing {
+            parameters: Some(gw::timing::Parameters::Delay(gw::DelayTimingInfo {
+                delay: Some(pbjson_types::Duration::from(
+                    self.region_conf.get_defaults().join_accept_delay2,
+                )),
+            })),
+        });
+
+        // set downlink item
+        self.downlink_frame
+            .items
+            .push(chirpstack_api::gw::DownlinkFrameItem {
+                tx_info: Some(tx_info),
+                ..Default::default()
+            });
+
+        Ok(())
+    }
+
+    fn set_tx_info_for_rx2_relayed(&mut self) -> Result<()> {
+        trace!("Setting relay tx-info for RX2");
+
+        let gw_down = self.downlink_gateway.as_ref().unwrap();
+        let relay_ctx = self.relay_context.unwrap();
+        let relay_ds = relay_ctx.device.get_device_session()?;
+
+        // Get frequency.
+        let frequency = relay_ds.rx2_frequency;
+
+        let mut tx_info = chirpstack_api::gw::DownlinkTxInfo {
+            board: gw_down.board,
+            antenna: gw_down.antenna,
+            context: gw_down.context.clone(),
+            frequency,
+            ..Default::default()
+        };
+
+        // get RX2 DR
+        let rx2_dr_index = relay_ds.rx2_dr as u8;
+        let rx2_dr = self.region_conf.get_data_rate(false, rx2_dr_index)?;
+
+        // set DR to tx_info
+        helpers::set_tx_info_data_rate(&mut tx_info, &rx2_dr)?;
+
+        // set tx-power
+        if self.network_conf.downlink_tx_power != -1 {
+            tx_info.power = self.network_conf.downlink_tx_power;
+        } else {
+            tx_info.power = self
+                .region_conf
+                .get_downlink_tx_power_eirp(tx_info.frequency) as i32;
+        }
+
+        // Set timestamp.
+        let delay = if relay_ds.rx1_delay > 0 {
+            Duration::from_secs(relay_ds.rx1_delay as u64 + 1)
+        } else {
+            self.region_conf.get_defaults().rx2_delay
+        };
+        tx_info.timing = Some(gw::Timing {
+            parameters: Some(gw::timing::Parameters::Delay(gw::DelayTimingInfo {
+                delay: Some(pbjson_types::Duration::from(delay)),
+            })),
+        });
+
+        // set downlink item
+        self.downlink_frame
+            .items
+            .push(chirpstack_api::gw::DownlinkFrameItem {
+                tx_info: Some(tx_info),
+                ..Default::default()
+            });
+
+        Ok(())
+    }
+
+    fn set_downlink_frame(&mut self) -> Result<()> {
+        trace!("Setting downlink frame");
+
+        let phy_b = self.join_accept.to_vec()?;
+        for i in &mut self.downlink_frame.items {
+            i.phy_payload.clone_from(&phy_b);
+        }
+
+        Ok(())
+    }
+
+    fn set_downlink_frame_relayed(&mut self) -> Result<()> {
+        trace!("Setting ForwardDownlinkReq frame");
+
+        let relay_ctx = self.relay_context.as_ref().unwrap();
+        let relay_ds = relay_ctx.device.get_device_session()?;
+
+        let mut relay_phy = lrwn::PhyPayload {
+            mhdr: lrwn::MHDR {
+                f_type: lrwn::FType::UnconfirmedDataDown,
+                major: lrwn::Major::LoRaWANR1,
+            },
+            payload: lrwn::Payload::MACPayload(lrwn::MACPayload {
+                fhdr: lrwn::FHDR {
+                    devaddr: relay_ctx.device.get_dev_addr()?,
+                    f_cnt: if relay_ds.mac_version().to_string().starts_with("1.0") {
+                        relay_ds.n_f_cnt_down
+                    } else {
+                        relay_ds.a_f_cnt_down
+                    },
+                    f_ctrl: lrwn::FCtrl {
+                        adr: !self.network_conf.adr_disabled,
+                        ack: relay_ctx.must_ack,
+                        ..Default::default()
+                    },
+                    f_opts: lrwn::MACCommandSet::new(vec![]),
+                },
+                f_port: Some(lrwn::LA_FPORT_RELAY),
+                frm_payload: Some(lrwn::FRMPayload::ForwardDownlinkReq(
+                    lrwn::ForwardDownlinkReq {
+                        payload: Box::new(self.join_accept.clone()),
+                    },
+                )),
+            }),
+            mic: None,
+        };
+
+        relay_phy.encrypt_frm_payload(&lrwn::AES128Key::from_slice(&relay_ds.nwk_s_enc_key)?)?;
+
+        // Set MIC.
+        // If this is an ACK, then FCntUp has already been incremented by one. If
+        // this is not an ACK, then DownlinkDataMIC will zero out ConfFCnt.
+        relay_phy.set_downlink_data_mic(
+            relay_ds.mac_version().from_proto(),
+            (relay_ctx.device.f_cnt_up as u32) - 1,
+            &lrwn::AES128Key::from_slice(&relay_ds.s_nwk_s_int_key)?,
+        )?;
+
+        let relay_phy_b = relay_phy.to_vec()?;
+        for i in &mut self.downlink_frame.items {
+            i.phy_payload.clone_from(&relay_phy_b);
+        }
+
+        Ok(())
+    }
+
+    async fn send_join_accept_response(&self) -> Result<()> {
+        trace!("Sending join-accept response");
+
+        send_downlink(
+            &self.uplink_frame_set.region_config_id,
+            &self.downlink_frame,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn save_downlink_frame(&self) -> Result<()> {
+        trace!("Saving downlink frame");
+        let ds = self.device.get_device_session()?;
+
+        let df = chirpstack_api::internal::DownlinkFrame {
+            dev_eui: self.device.dev_eui.to_be_bytes().to_vec(),
+            downlink_id: self.downlink_frame.downlink_id,
+            downlink_frame: Some(self.downlink_frame.clone()),
+            nwk_s_enc_key: ds.nwk_s_enc_key.clone(),
+            ..Default::default()
+        };
+
+        downlink_frame::save(&df)
+            .await
+            .context("Saving downlink-frame error")?;
+
+        Ok(())
+    }
+
+    async fn save_downlink_frame_relayed(&self) -> Result<()> {
+        trace!("Saving ForwardDownlinkReq frame");
+
+        let relay_ctx = self.relay_context.as_ref().unwrap();
+        let relay_ds = relay_ctx.device.get_device_session()?;
+
+        let df = chirpstack_api::internal::DownlinkFrame {
+            dev_eui: relay_ctx.device.dev_eui.to_be_bytes().to_vec(),
+            dev_eui_relayed: self.device.dev_eui.to_be_bytes().to_vec(),
+            downlink_id: self.downlink_frame.downlink_id,
+            downlink_frame: Some(self.downlink_frame.clone()),
+            nwk_s_enc_key: relay_ds.nwk_s_enc_key.clone(),
+            a_f_cnt_down: relay_ds.get_a_f_cnt_down(),
+            n_f_cnt_down: relay_ds.n_f_cnt_down,
+            ..Default::default()
+        };
+
+        downlink_frame::save(&df).await?;
+        Ok(())
+    }
+
+    fn _prefer_rx2_dr(&self) -> Result<bool> {
+        let ds = self.device.get_device_session()?;
+
+        // The device has not yet been updated to the network-server RX2 parameters
+        // (using mac-commands). Do not prefer RX2 over RX1 in this case.
+        if ds.rx2_frequency != self.network_conf.rx2_frequency
+            || ds.rx2_dr != self.network_conf.rx2_dr as u32
+            || ds.rx1_dr_offset != self.network_conf.rx1_dr_offset as u32
+            || ds.rx1_delay != self.network_conf.rx1_delay as u32
+        {
+            return Ok(false);
+        }
+
+        // get rx1 data-rate
+        let dr_rx1 = self
+            .region_conf
+            .get_rx1_data_rate_index(self.uplink_frame_set.dr, ds.rx1_dr_offset as usize)?;
+
+        if dr_rx1 < self.network_conf.rx2_prefer_on_rx1_dr_lt {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn _prefer_rx2_link_budget(&self) -> Result<bool> {
+        let ds = self.device.get_device_session()?;
+
+        // The device has not yet been updated to the network-server RX2 parameters
+        // (using mac-commands). Do not prefer RX2 over RX1 in this case.
+        if ds.rx2_frequency != self.network_conf.rx2_frequency
+            || ds.rx2_dr != self.network_conf.rx2_dr as u32
+            || ds.rx1_dr_offset != self.network_conf.rx1_dr_offset as u32
+            || ds.rx1_delay != self.network_conf.rx1_delay as u32
+        {
+            return Ok(false);
+        }
+
+        // get rx1 data-rate
+        let dr_rx1_index = self
+            .region_conf
+            .get_rx1_data_rate_index(self.uplink_frame_set.dr, ds.rx1_dr_offset as usize)?;
+
+        let rx1_dr = self.region_conf.get_data_rate(false, dr_rx1_index)?;
+        let rx2_dr = self.region_conf.get_data_rate(false, ds.rx2_dr as u8)?;
+
+        // the calculation below only applies for LORA modulation
+        if let lrwn::region::DataRateModulation::Lora(rx1_dr) = rx1_dr
+            && let lrwn::region::DataRateModulation::Lora(rx2_dr) = rx2_dr
+        {
+            let tx_power_rx1 = if self.network_conf.downlink_tx_power != -1 {
+                self.network_conf.downlink_tx_power
+            } else {
+                self.region_conf.get_downlink_tx_power_eirp(
+                    self.region_conf.get_rx1_frequency_for_uplink_frequency(
+                        self.uplink_frame_set.tx_info.frequency,
+                    )?,
+                ) as i32
+            };
+
+            let tx_power_rx2 = if self.network_conf.downlink_tx_power != -1 {
+                self.network_conf.downlink_tx_power
+            } else {
+                self.region_conf
+                    .get_downlink_tx_power_eirp(ds.rx2_frequency) as i32
+            };
+
+            let link_budget_rx1 = sensitivity::calculate_link_budget(
+                rx1_dr.bandwidth,
+                6.0,
+                config::get_required_snr_for_sf(rx1_dr.spreading_factor)?,
+                tx_power_rx1 as f32,
+            );
+
+            let link_budget_rx2 = sensitivity::calculate_link_budget(
+                rx2_dr.bandwidth,
+                6.0,
+                config::get_required_snr_for_sf(rx2_dr.spreading_factor)?,
+                tx_power_rx2 as f32,
+            );
+
+            return Ok(link_budget_rx2 > link_budget_rx1);
+        }
+
+        Ok(false)
+    }
+}

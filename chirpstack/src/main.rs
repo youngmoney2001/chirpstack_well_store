@@ -1,0 +1,161 @@
+#![recursion_limit = "256"]
+
+extern crate diesel_migrations;
+#[macro_use]
+extern crate diesel;
+#[macro_use]
+extern crate anyhow;
+
+use std::path::Path;
+use std::str::FromStr;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use tracing::Level;
+use tracing_subscriber::{filter, prelude::*};
+
+use lrwn::EUI64;
+
+mod adr;
+mod aeskey;
+mod api;
+mod applayer;
+mod backend;
+mod certificate;
+mod cmd;
+mod codec;
+mod config;
+mod devaddr;
+mod downlink;
+mod gateway;
+mod gpstime;
+mod helpers;
+mod integration;
+mod maccommand;
+mod monitoring;
+mod region;
+mod sensitivity;
+mod storage;
+mod stream;
+#[cfg(test)]
+mod test;
+mod uplink;
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Path to configuration directory
+    #[arg(short, long, value_name = "DIR")]
+    config: String,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Print the configuration template
+    Configfile {},
+
+    /// Print the device-session for debugging
+    PrintDs {
+        /// Device EUI
+        #[arg(long, value_name = "DEV_EUI")]
+        dev_eui: String,
+    },
+
+    /// Import device-profiles repository.
+    ImportDeviceProfiles {
+        /// Path to repository root.
+        #[arg(short, long, value_name = "DIR")]
+        dir: String,
+    },
+
+    /// Create global API key.
+    CreateApiKey {
+        /// Name.
+        #[arg(short, long, value_name = "NAME")]
+        name: String,
+    },
+
+    /// Set user password.
+    SetPassword {
+        /// User email address.
+        #[arg(short, long, value_name = "EMAIL")]
+        email: String,
+
+        /// Path to file containing the new password.
+        #[arg(short, long, value_name = "FILE")]
+        password_file: Option<String>,
+
+        /// Read password from stdin.
+        #[arg(long)]
+        stdin: bool,
+    },
+
+    /// Migrate device-sessions from Redis to PostgreSQL.
+    MigrateDeviceSessionsToPostgres {},
+
+    /// Migrate device-profile templates to device profiles.
+    MigrateDeviceProfileTemplates {},
+
+    /// Migrate Device <> Gateway Rx Info.
+    MigrateDeviceGatewayRxInfo {},
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    config::load(Path::new(&cli.config))?;
+
+    let conf = config::get();
+    let filter = filter::Targets::new().with_targets(vec![
+        ("chirpstack", Level::from_str(&conf.logging.level).unwrap()),
+        ("backend", Level::from_str(&conf.logging.level).unwrap()),
+        ("lrwn", Level::from_str(&conf.logging.level).unwrap()),
+    ]);
+    if conf.logging.json {
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .flatten_event(conf.logging.flatten_json),
+            )
+            .with(filter)
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(filter)
+            .init();
+    }
+
+    match &cli.command {
+        Some(Commands::Configfile {}) => cmd::configfile::run(),
+        Some(Commands::PrintDs { dev_eui }) => {
+            let dev_eui = EUI64::from_str(dev_eui).unwrap();
+            cmd::print_ds::run(&dev_eui).await.unwrap();
+        }
+        Some(Commands::ImportDeviceProfiles { dir }) => {
+            cmd::import_device_profiles::run(Path::new(&dir))
+                .await
+                .unwrap()
+        }
+        Some(Commands::CreateApiKey { name }) => cmd::create_api_key::run(name).await?,
+        Some(Commands::SetPassword {
+            email,
+            password_file,
+            stdin,
+        }) => cmd::set_password::run(email, password_file, *stdin).await?,
+        Some(Commands::MigrateDeviceSessionsToPostgres {}) => cmd::migrate_ds_to_pg::run().await?,
+        Some(Commands::MigrateDeviceProfileTemplates {}) => {
+            cmd::migrate_device_profile_templates::run().await?
+        }
+        Some(Commands::MigrateDeviceGatewayRxInfo {}) => {
+            cmd::migrate_device_gateway_rx_info::run().await?
+        }
+        None => cmd::root::run().await?,
+    }
+
+    Ok(())
+}

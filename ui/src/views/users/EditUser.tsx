@@ -1,0 +1,84 @@
+import { useEffect, useState } from "react";
+import { useNavigate, useParams, Link } from "react-router";
+
+import { Space, Breadcrumb, Card, Button } from "antd";
+
+import type { User, GetUserResponse } from "@chirpstack/chirpstack-api-grpc-web/api/user_pb";
+import { GetUserRequest, UpdateUserRequest, DeleteUserRequest } from "@chirpstack/chirpstack-api-grpc-web/api/user_pb";
+
+import PageHeader from "../../components/PageHeader";
+import UserForm from "./UserForm";
+import UserStore from "../../stores/UserStore";
+import DeleteConfirm from "../../components/DeleteConfirm";
+import { useTitle } from "../helpers";
+
+function EditUser() {
+  const navigate = useNavigate();
+  const { userId } = useParams();
+  const [user, setUser] = useState<User | undefined>(undefined);
+  useTitle("Network Server", "Users", user?.getEmail());
+
+  useEffect(() => {
+    const req = new GetUserRequest();
+    req.setId(userId!);
+
+    UserStore.get(req, (resp: GetUserResponse) => {
+      setUser(resp.getUser());
+    });
+  }, [userId]);
+
+  const onFinish = (obj: User, password: string) => {
+    const req = new UpdateUserRequest();
+    req.setUser(obj);
+
+    UserStore.update(req, () => {
+      navigate("/users");
+    });
+  };
+
+  const deleteUser = () => {
+    if (!user) {
+      return;
+    }
+
+    const req = new DeleteUserRequest();
+    req.setId(user.getId());
+
+    UserStore.delete(req, () => {
+      navigate("/users");
+    });
+  };
+
+  if (!user) {
+    return null;
+  }
+
+  return (
+    <Space orientation="vertical" style={{ width: "100%" }} size="large">
+      <PageHeader
+        breadcrumbRender={() => (
+          <Breadcrumb
+            items={[{ title: "Network Server" }, { title: <Link to="/users">Users</Link> }, { title: user.getEmail() }]}
+          />
+        )}
+        title={user.getEmail()}
+        subTitle={`user id: ${user.getId()}`}
+        extra={[
+          <Button key="change-password">
+            <Link to={`/users/${user.getId()}/password`}>Change password</Link>
+          </Button>,
+          <DeleteConfirm typ="user" confirm={user.getEmail()} onConfirm={deleteUser} key="delete-user">
+            <Button danger type="primary">
+              Delete user
+            </Button>
+          </DeleteConfirm>,
+        ]}
+      />
+      <Card>
+        <UserForm initialValues={user} onFinish={onFinish} password={false} />
+      </Card>
+    </Space>
+  );
+}
+
+export default EditUser;

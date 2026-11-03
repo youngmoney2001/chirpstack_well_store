@@ -1,0 +1,19 @@
+.PHONY: requirements api
+
+all: requirements api
+
+requirements:
+	mkdir -p api
+	go install github.com/pseudomuto/protoc-gen-doc/cmd/protoc-gen-doc@v1.5.1
+
+api:
+	protoc -I=../proto --doc_out=./api --doc_opt=markdown,api.md \
+		api/application.proto \
+		api/device.proto \
+		api/device_profile.proto \
+		api/gateway.proto \
+		api/multicast_group.proto \
+		api/relay.proto \
+		api/tenant.proto \
+		api/user.proto \
+		api/fuota.proto

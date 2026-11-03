@@ -1,0 +1,1225 @@
+use std::str::FromStr;
+
+use chirpstack_api::api;
+use chirpstack_api::api::device_profile_service_server::DeviceProfileService;
+use chirpstack_api::tonic::{self, Request, Response, Status};
+use uuid::Uuid;
+
+use super::auth::validator;
+use super::error::ToStatus;
+use super::helpers;
+use super::helpers::{FromProto, ToProto};
+use crate::adr;
+use crate::storage::{device_profile, fields};
+
+pub struct DeviceProfile {
+    validator: validator::RequestValidator,
+}
+
+impl DeviceProfile {
+    pub fn new(validator: validator::RequestValidator) -> Self {
+        DeviceProfile { validator }
+    }
+}
+
+#[tonic::async_trait]
+impl DeviceProfileService for DeviceProfile {
+    async fn create(
+        &self,
+        request: Request<api::CreateDeviceProfileRequest>,
+    ) -> Result<Response<api::CreateDeviceProfileResponse>, Status> {
+        let req_dp = match &request.get_ref().device_profile {
+            Some(v) => v,
+            None => {
+                return Err(Status::invalid_argument("device_profile is missing"));
+            }
+        };
+        let tenant_id = Uuid::from_str(&req_dp.tenant_id).map_err(|e| e.status())?;
+
+        self.validator
+            .validate(
+                request.extensions(),
+                validator::ValidateDeviceProfilesAccess::new(
+                    validator::Flag::Create,
+                    Some(tenant_id),
+                    false,
+                ),
+            )
+            .await?;
+
+        let mut dp = device_profile::DeviceProfile {
+            tenant_id: Some(tenant_id.into()),
+            name: req_dp.name.clone(),
+            description: req_dp.description.clone(),
+            region: req_dp.region().from_proto(),
+            mac_version: req_dp.mac_version().from_proto(),
+            reg_params_revision: req_dp.reg_params_revision().from_proto(),
+            adr_algorithm_id: req_dp.adr_algorithm_id.clone(),
+            payload_codec_runtime: req_dp.payload_codec_runtime().from_proto(),
+            payload_codec_script: req_dp.payload_codec_script.clone(),
+            flush_queue_on_activate: req_dp.flush_queue_on_activate,
+            uplink_interval: req_dp.uplink_interval as i32,
+            device_status_req_interval: req_dp.device_status_req_interval as i32,
+            supports_otaa: req_dp.supports_otaa,
+            supports_class_b: req_dp.supports_class_b,
+            supports_class_c: req_dp.supports_class_c,
+            tags: fields::KeyValue::new(req_dp.tags.clone()),
+            measurements: fields::Measurements::new(
+                req_dp
+                    .measurements
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.to_string(),
+                            fields::Measurement {
+                                name: v.name.clone(),
+                                kind: v.kind().from_proto(),
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            auto_detect_measurements: req_dp.auto_detect_measurements,
+            region_config_id: (!req_dp.region_config_id.is_empty())
+                .then(|| req_dp.region_config_id.clone()),
+            allow_roaming: req_dp.allow_roaming,
+            rx1_delay: req_dp.rx1_delay as i16,
+            abp_params: if req_dp.supports_otaa {
+                None
+            } else {
+                Some(fields::AbpParams {
+                    rx1_delay: req_dp.abp_rx1_delay as u8,
+                    rx1_dr_offset: req_dp.abp_rx1_dr_offset as u8,
+                    rx2_dr: req_dp.abp_rx2_dr as u8,
+                    rx2_freq: req_dp.abp_rx2_freq,
+                })
+            },
+            class_b_params: if req_dp.supports_class_b {
+                Some(fields::ClassBParams {
+                    timeout: req_dp.class_b_timeout as u16,
+                    ping_slot_periodicity: req_dp.class_b_ping_slot_periodicity as u8,
+                    ping_slot_dr: req_dp.class_b_ping_slot_dr as u8,
+                    ping_slot_freq: req_dp.class_b_ping_slot_freq,
+                    class_b_downlink_only: req_dp.class_b_downlink_only,
+                })
+            } else {
+                None
+            },
+            class_c_params: if req_dp.supports_class_c {
+                Some(fields::ClassCParams {
+                    timeout: req_dp.class_c_timeout as u16,
+                })
+            } else {
+                None
+            },
+            relay_params: if req_dp.is_relay || req_dp.is_relay_ed {
+                Some(fields::RelayParams {
+                    is_relay: req_dp.is_relay,
+                    is_relay_ed: req_dp.is_relay_ed,
+                    ed_relay_only: req_dp.relay_ed_relay_only,
+                    relay_enabled: req_dp.relay_enabled,
+                    relay_cad_periodicity: req_dp.relay_cad_periodicity as u8,
+                    default_channel_index: req_dp.relay_default_channel_index as u8,
+                    second_channel_freq: req_dp.relay_second_channel_freq,
+                    second_channel_dr: req_dp.relay_second_channel_dr as u8,
+                    second_channel_ack_offset: req_dp.relay_second_channel_ack_offset as u8,
+                    ed_activation_mode: req_dp.relay_ed_activation_mode().from_proto(),
+                    ed_smart_enable_level: req_dp.relay_ed_smart_enable_level as u8,
+                    ed_back_off: req_dp.relay_ed_back_off as u8,
+                    ed_uplink_limit_bucket_size: req_dp.relay_ed_uplink_limit_bucket_size as u8,
+                    ed_uplink_limit_reload_rate: req_dp.relay_ed_uplink_limit_reload_rate as u8,
+                    relay_join_req_limit_reload_rate: req_dp.relay_join_req_limit_reload_rate as u8,
+                    relay_notify_limit_reload_rate: req_dp.relay_notify_limit_reload_rate as u8,
+                    relay_global_uplink_limit_reload_rate: req_dp
+                        .relay_global_uplink_limit_reload_rate
+                        as u8,
+                    relay_overall_limit_reload_rate: req_dp.relay_overall_limit_reload_rate as u8,
+                    relay_join_req_limit_bucket_size: req_dp.relay_join_req_limit_bucket_size as u8,
+                    relay_notify_limit_bucket_size: req_dp.relay_notify_limit_bucket_size as u8,
+                    relay_global_uplink_limit_bucket_size: req_dp
+                        .relay_global_uplink_limit_bucket_size
+                        as u8,
+                    relay_overall_limit_bucket_size: req_dp.relay_overall_limit_bucket_size as u8,
+                })
+            } else {
+                None
+            },
+            app_layer_params: {
+                let app_layer_params = req_dp.app_layer_params.unwrap_or_default();
+
+                fields::AppLayerParams {
+                    ts003_version: app_layer_params.ts003_version().from_proto(),
+                    ts004_version: app_layer_params.ts004_version().from_proto(),
+                    ts005_version: app_layer_params.ts005_version().from_proto(),
+                    ..Default::default()
+                }
+            },
+            supported_uplink_data_rates: fields::DataRates::new(
+                req_dp
+                    .supported_uplink_data_rates
+                    .iter()
+                    .map(|&v| Some(v as i16))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+
+        dp = device_profile::create(dp).await.map_err(|e| e.status())?;
+
+        let mut resp = Response::new(api::CreateDeviceProfileResponse {
+            id: dp.id.to_string(),
+        });
+        resp.metadata_mut().insert(
+            "x-log-device_profile_id",
+            dp.id.to_string().parse().unwrap(),
+        );
+
+        Ok(resp)
+    }
+
+    async fn get(
+        &self,
+        request: Request<api::GetDeviceProfileRequest>,
+    ) -> Result<Response<api::GetDeviceProfileResponse>, Status> {
+        let req = request.get_ref();
+        let dp_id = Uuid::from_str(&req.id).map_err(|e| e.status())?;
+
+        self.validator
+            .validate(
+                request.extensions(),
+                validator::ValidateDeviceProfileAccess::new(validator::Flag::Read, dp_id),
+            )
+            .await?;
+
+        let dp = device_profile::get(&dp_id).await.map_err(|e| e.status())?;
+        let abp_params = dp.abp_params.clone().unwrap_or_default();
+        let class_b_params = dp.class_b_params.clone().unwrap_or_default();
+        let class_c_params = dp.class_c_params.clone().unwrap_or_default();
+        let relay_params = dp.relay_params.clone().unwrap_or_default();
+
+        let mut resp = Response::new(api::GetDeviceProfileResponse {
+            device_profile: Some(api::DeviceProfile {
+                id: dp.id.to_string(),
+                tenant_id: dp.tenant_id.map(|v| v.to_string()).unwrap_or_default(),
+                name: dp.name,
+                description: dp.description,
+                region: dp.region.to_proto().into(),
+                mac_version: dp.mac_version.to_proto().into(),
+                reg_params_revision: dp.reg_params_revision.to_proto().into(),
+                adr_algorithm_id: dp.adr_algorithm_id,
+                payload_codec_runtime: dp.payload_codec_runtime.to_proto().into(),
+                payload_codec_script: dp.payload_codec_script,
+                flush_queue_on_activate: dp.flush_queue_on_activate,
+                uplink_interval: dp.uplink_interval as u32,
+                device_status_req_interval: dp.device_status_req_interval as u32,
+                supports_otaa: dp.supports_otaa,
+                supports_class_b: dp.supports_class_b,
+                supports_class_c: dp.supports_class_c,
+                class_b_timeout: class_b_params.timeout as u32,
+                class_b_ping_slot_periodicity: class_b_params.ping_slot_periodicity as u32,
+                class_b_ping_slot_dr: class_b_params.ping_slot_dr as u32,
+                class_b_ping_slot_freq: class_b_params.ping_slot_freq as u32,
+                class_b_downlink_only: class_b_params.class_b_downlink_only,
+                class_c_timeout: class_c_params.timeout as u32,
+                abp_rx1_delay: abp_params.rx1_delay as u32,
+                abp_rx1_dr_offset: abp_params.rx1_dr_offset as u32,
+                abp_rx2_dr: abp_params.rx2_dr as u32,
+                abp_rx2_freq: abp_params.rx2_freq as u32,
+                tags: dp.tags.into_hashmap(),
+                measurements: dp
+                    .measurements
+                    .into_hashmap()
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.to_string(),
+                            api::Measurement {
+                                name: v.name.clone(),
+                                kind: v.kind.to_proto().into(),
+                            },
+                        )
+                    })
+                    .collect(),
+                auto_detect_measurements: dp.auto_detect_measurements,
+                region_config_id: dp.region_config_id.clone().unwrap_or_default(),
+                is_relay: relay_params.is_relay,
+                is_relay_ed: relay_params.is_relay_ed,
+                relay_ed_relay_only: relay_params.ed_relay_only,
+                relay_enabled: relay_params.relay_enabled,
+                relay_cad_periodicity: relay_params.relay_cad_periodicity as i32,
+                relay_default_channel_index: relay_params.default_channel_index as u32,
+                relay_second_channel_freq: relay_params.second_channel_freq as u32,
+                relay_second_channel_dr: relay_params.second_channel_dr as u32,
+                relay_second_channel_ack_offset: relay_params.second_channel_ack_offset as i32,
+                relay_ed_activation_mode: relay_params.ed_activation_mode.to_proto().into(),
+                relay_ed_smart_enable_level: relay_params.ed_smart_enable_level as u32,
+                relay_ed_back_off: relay_params.ed_back_off as u32,
+                relay_ed_uplink_limit_bucket_size: relay_params.ed_uplink_limit_bucket_size as u32,
+                relay_ed_uplink_limit_reload_rate: relay_params.ed_uplink_limit_reload_rate as u32,
+                relay_join_req_limit_reload_rate: relay_params.relay_join_req_limit_reload_rate
+                    as u32,
+                relay_notify_limit_reload_rate: relay_params.relay_notify_limit_reload_rate as u32,
+                relay_global_uplink_limit_reload_rate: relay_params
+                    .relay_global_uplink_limit_reload_rate
+                    as u32,
+                relay_overall_limit_reload_rate: relay_params.relay_overall_limit_reload_rate
+                    as u32,
+                relay_join_req_limit_bucket_size: relay_params.relay_join_req_limit_bucket_size
+                    as u32,
+                relay_notify_limit_bucket_size: relay_params.relay_notify_limit_bucket_size as u32,
+                relay_global_uplink_limit_bucket_size: relay_params
+                    .relay_global_uplink_limit_bucket_size
+                    as u32,
+                relay_overall_limit_bucket_size: relay_params.relay_overall_limit_bucket_size
+                    as u32,
+                allow_roaming: dp.allow_roaming,
+                rx1_delay: dp.rx1_delay as u32,
+                app_layer_params: Some(api::AppLayerParams {
+                    ts003_version: dp.app_layer_params.ts003_version.to_proto().into(),
+                    ts003_f_port: dp.app_layer_params.ts003_f_port as u32,
+                    ts004_version: dp.app_layer_params.ts004_version.to_proto().into(),
+                    ts004_f_port: dp.app_layer_params.ts004_f_port as u32,
+                    ts005_version: dp.app_layer_params.ts005_version.to_proto().into(),
+                    ts005_f_port: dp.app_layer_params.ts005_f_port as u32,
+                }),
+                device_id: dp.device_id.map(|v| v.to_string()).unwrap_or_default(),
+                firmware_version: dp.firmware_version.clone(),
+                supported_uplink_data_rates: dp
+                    .supported_uplink_data_rates
+                    .iter()
+                    .filter_map(|&v| v.map(|v| v as u32))
+                    .collect(),
+            }),
+            created_at: Some(helpers::datetime_to_prost_timestamp(&dp.created_at)),
+            updated_at: Some(helpers::datetime_to_prost_timestamp(&dp.updated_at)),
+        });
+        resp.metadata_mut()
+            .insert("x-log-device_profile_id", req.id.parse().unwrap());
+
+        Ok(resp)
+    }
+
+    async fn get_by_profile_id(
+        &self,
+        request: Request<api::GetDeviceProfileByProfileIdRequest>,
+    ) -> Result<Response<api::GetDeviceProfileByProfileIdResponse>, Status> {
+        let req = request.get_ref();
+
+        self.validator
+            .validate(
+                request.extensions(),
+                validator::ValidateDeviceProfilesAccess::new(validator::Flag::List, None, true),
+            )
+            .await?;
+
+        let dp =
+            device_profile::get_by_profile_id(req.vendor_id as i32, req.vendor_profile_id as i32)
+                .await
+                .map_err(|e| e.status())?;
+        let abp_params = dp.abp_params.clone().unwrap_or_default();
+        let class_b_params = dp.class_b_params.clone().unwrap_or_default();
+        let class_c_params = dp.class_c_params.clone().unwrap_or_default();
+        let relay_params = dp.relay_params.clone().unwrap_or_default();
+
+        let mut resp = Response::new(api::GetDeviceProfileByProfileIdResponse {
+            device_profile: Some(api::DeviceProfile {
+                id: dp.id.to_string(),
+                tenant_id: dp.tenant_id.map(|v| v.to_string()).unwrap_or_default(),
+                name: dp.name,
+                description: dp.description,
+                region: dp.region.to_proto().into(),
+                mac_version: dp.mac_version.to_proto().into(),
+                reg_params_revision: dp.reg_params_revision.to_proto().into(),
+                adr_algorithm_id: dp.adr_algorithm_id,
+                payload_codec_runtime: dp.payload_codec_runtime.to_proto().into(),
+                payload_codec_script: dp.payload_codec_script,
+                flush_queue_on_activate: dp.flush_queue_on_activate,
+                uplink_interval: dp.uplink_interval as u32,
+                device_status_req_interval: dp.device_status_req_interval as u32,
+                supports_otaa: dp.supports_otaa,
+                supports_class_b: dp.supports_class_b,
+                supports_class_c: dp.supports_class_c,
+                class_b_timeout: class_b_params.timeout as u32,
+                class_b_ping_slot_periodicity: class_b_params.ping_slot_periodicity as u32,
+                class_b_ping_slot_dr: class_b_params.ping_slot_dr as u32,
+                class_b_ping_slot_freq: class_b_params.ping_slot_freq as u32,
+                class_b_downlink_only: class_b_params.class_b_downlink_only,
+                class_c_timeout: class_c_params.timeout as u32,
+                abp_rx1_delay: abp_params.rx1_delay as u32,
+                abp_rx1_dr_offset: abp_params.rx1_dr_offset as u32,
+                abp_rx2_dr: abp_params.rx2_dr as u32,
+                abp_rx2_freq: abp_params.rx2_freq as u32,
+                tags: dp.tags.into_hashmap(),
+                measurements: dp
+                    .measurements
+                    .into_hashmap()
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.to_string(),
+                            api::Measurement {
+                                name: v.name.clone(),
+                                kind: v.kind.to_proto().into(),
+                            },
+                        )
+                    })
+                    .collect(),
+                auto_detect_measurements: dp.auto_detect_measurements,
+                region_config_id: dp.region_config_id.clone().unwrap_or_default(),
+                is_relay: relay_params.is_relay,
+                is_relay_ed: relay_params.is_relay_ed,
+                relay_ed_relay_only: relay_params.ed_relay_only,
+                relay_enabled: relay_params.relay_enabled,
+                relay_cad_periodicity: relay_params.relay_cad_periodicity as i32,
+                relay_default_channel_index: relay_params.default_channel_index as u32,
+                relay_second_channel_freq: relay_params.second_channel_freq as u32,
+                relay_second_channel_dr: relay_params.second_channel_dr as u32,
+                relay_second_channel_ack_offset: relay_params.second_channel_ack_offset as i32,
+                relay_ed_activation_mode: relay_params.ed_activation_mode.to_proto().into(),
+                relay_ed_smart_enable_level: relay_params.ed_smart_enable_level as u32,
+                relay_ed_back_off: relay_params.ed_back_off as u32,
+                relay_ed_uplink_limit_bucket_size: relay_params.ed_uplink_limit_bucket_size as u32,
+                relay_ed_uplink_limit_reload_rate: relay_params.ed_uplink_limit_reload_rate as u32,
+                relay_join_req_limit_reload_rate: relay_params.relay_join_req_limit_reload_rate
+                    as u32,
+                relay_notify_limit_reload_rate: relay_params.relay_notify_limit_reload_rate as u32,
+                relay_global_uplink_limit_reload_rate: relay_params
+                    .relay_global_uplink_limit_reload_rate
+                    as u32,
+                relay_overall_limit_reload_rate: relay_params.relay_overall_limit_reload_rate
+                    as u32,
+                relay_join_req_limit_bucket_size: relay_params.relay_join_req_limit_bucket_size
+                    as u32,
+                relay_notify_limit_bucket_size: relay_params.relay_notify_limit_bucket_size as u32,
+                relay_global_uplink_limit_bucket_size: relay_params
+                    .relay_global_uplink_limit_bucket_size
+                    as u32,
+                relay_overall_limit_bucket_size: relay_params.relay_overall_limit_bucket_size
+                    as u32,
+                allow_roaming: dp.allow_roaming,
+                rx1_delay: dp.rx1_delay as u32,
+                app_layer_params: Some(api::AppLayerParams {
+                    ts003_version: dp.app_layer_params.ts003_version.to_proto().into(),
+                    ts003_f_port: dp.app_layer_params.ts003_f_port as u32,
+                    ts004_version: dp.app_layer_params.ts004_version.to_proto().into(),
+                    ts004_f_port: dp.app_layer_params.ts004_f_port as u32,
+                    ts005_version: dp.app_layer_params.ts005_version.to_proto().into(),
+                    ts005_f_port: dp.app_layer_params.ts005_f_port as u32,
+                }),
+                device_id: dp.device_id.map(|v| v.to_string()).unwrap_or_default(),
+                firmware_version: dp.firmware_version.clone(),
+                supported_uplink_data_rates: dp
+                    .supported_uplink_data_rates
+                    .iter()
+                    .filter_map(|&v| v.map(|v| v as u32))
+                    .collect(),
+            }),
+            created_at: Some(helpers::datetime_to_prost_timestamp(&dp.created_at)),
+            updated_at: Some(helpers::datetime_to_prost_timestamp(&dp.updated_at)),
+        });
+        resp.metadata_mut()
+            .insert("x-log-device_profile_vendor_id", req.vendor_id.into());
+        resp.metadata_mut().insert(
+            "x-log-device_profile_vendor_profile_id",
+            req.vendor_profile_id.into(),
+        );
+
+        Ok(resp)
+    }
+
+    async fn update(
+        &self,
+        request: Request<api::UpdateDeviceProfileRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req_dp = match &request.get_ref().device_profile {
+            Some(v) => v,
+            None => {
+                return Err(Status::invalid_argument("device_profile is missing"));
+            }
+        };
+        let dp_id = Uuid::from_str(&req_dp.id).map_err(|e| e.status())?;
+
+        self.validator
+            .validate(
+                request.extensions(),
+                validator::ValidateDeviceProfileAccess::new(validator::Flag::Update, dp_id),
+            )
+            .await?;
+
+        // update
+        let _ = device_profile::update(device_profile::DeviceProfile {
+            id: dp_id.into(),
+            name: req_dp.name.clone(),
+            description: req_dp.description.clone(),
+            region: req_dp.region().from_proto(),
+            mac_version: req_dp.mac_version().from_proto(),
+            reg_params_revision: req_dp.reg_params_revision().from_proto(),
+            adr_algorithm_id: req_dp.adr_algorithm_id.clone(),
+            payload_codec_runtime: req_dp.payload_codec_runtime().from_proto(),
+            payload_codec_script: req_dp.payload_codec_script.clone(),
+            flush_queue_on_activate: req_dp.flush_queue_on_activate,
+            uplink_interval: req_dp.uplink_interval as i32,
+            device_status_req_interval: req_dp.device_status_req_interval as i32,
+            supports_otaa: req_dp.supports_otaa,
+            supports_class_b: req_dp.supports_class_b,
+            supports_class_c: req_dp.supports_class_c,
+            tags: fields::KeyValue::new(req_dp.tags.clone()),
+            measurements: fields::Measurements::new(
+                req_dp
+                    .measurements
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.to_string(),
+                            fields::Measurement {
+                                name: v.name.clone(),
+                                kind: v.kind().from_proto(),
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            auto_detect_measurements: req_dp.auto_detect_measurements,
+            region_config_id: (!req_dp.region_config_id.is_empty())
+                .then(|| req_dp.region_config_id.clone()),
+            allow_roaming: req_dp.allow_roaming,
+            rx1_delay: req_dp.rx1_delay as i16,
+            abp_params: if req_dp.supports_otaa {
+                None
+            } else {
+                Some(fields::AbpParams {
+                    rx1_delay: req_dp.abp_rx1_delay as u8,
+                    rx1_dr_offset: req_dp.abp_rx1_dr_offset as u8,
+                    rx2_dr: req_dp.abp_rx2_dr as u8,
+                    rx2_freq: req_dp.abp_rx2_freq,
+                })
+            },
+            class_b_params: if req_dp.supports_class_b {
+                Some(fields::ClassBParams {
+                    timeout: req_dp.class_b_timeout as u16,
+                    ping_slot_periodicity: req_dp.class_b_ping_slot_periodicity as u8,
+                    ping_slot_dr: req_dp.class_b_ping_slot_dr as u8,
+                    ping_slot_freq: req_dp.class_b_ping_slot_freq,
+                    class_b_downlink_only: req_dp.class_b_downlink_only,
+                })
+            } else {
+                None
+            },
+            class_c_params: if req_dp.supports_class_c {
+                Some(fields::ClassCParams {
+                    timeout: req_dp.class_c_timeout as u16,
+                })
+            } else {
+                None
+            },
+            relay_params: if req_dp.is_relay || req_dp.is_relay_ed {
+                Some(fields::RelayParams {
+                    is_relay: req_dp.is_relay,
+                    is_relay_ed: req_dp.is_relay_ed,
+                    ed_relay_only: req_dp.relay_ed_relay_only,
+                    relay_enabled: req_dp.relay_enabled,
+                    relay_cad_periodicity: req_dp.relay_cad_periodicity as u8,
+                    default_channel_index: req_dp.relay_default_channel_index as u8,
+                    second_channel_freq: req_dp.relay_second_channel_freq,
+                    second_channel_dr: req_dp.relay_second_channel_dr as u8,
+                    second_channel_ack_offset: req_dp.relay_second_channel_ack_offset as u8,
+                    ed_activation_mode: req_dp.relay_ed_activation_mode().from_proto(),
+                    ed_smart_enable_level: req_dp.relay_ed_smart_enable_level as u8,
+                    ed_back_off: req_dp.relay_ed_back_off as u8,
+                    ed_uplink_limit_bucket_size: req_dp.relay_ed_uplink_limit_bucket_size as u8,
+                    ed_uplink_limit_reload_rate: req_dp.relay_ed_uplink_limit_reload_rate as u8,
+                    relay_join_req_limit_reload_rate: req_dp.relay_join_req_limit_reload_rate as u8,
+                    relay_notify_limit_reload_rate: req_dp.relay_notify_limit_reload_rate as u8,
+                    relay_global_uplink_limit_reload_rate: req_dp
+                        .relay_global_uplink_limit_reload_rate
+                        as u8,
+                    relay_overall_limit_reload_rate: req_dp.relay_overall_limit_reload_rate as u8,
+                    relay_join_req_limit_bucket_size: req_dp.relay_join_req_limit_bucket_size as u8,
+                    relay_notify_limit_bucket_size: req_dp.relay_notify_limit_bucket_size as u8,
+                    relay_global_uplink_limit_bucket_size: req_dp
+                        .relay_global_uplink_limit_bucket_size
+                        as u8,
+                    relay_overall_limit_bucket_size: req_dp.relay_overall_limit_bucket_size as u8,
+                })
+            } else {
+                None
+            },
+            app_layer_params: {
+                let app_layer_params = req_dp.app_layer_params.unwrap_or_default();
+
+                fields::AppLayerParams {
+                    ts003_version: app_layer_params.ts003_version().from_proto(),
+                    ts003_f_port: app_layer_params.ts003_f_port as u8,
+                    ts004_version: app_layer_params.ts004_version().from_proto(),
+                    ts004_f_port: app_layer_params.ts004_f_port as u8,
+                    ts005_version: app_layer_params.ts005_version().from_proto(),
+                    ts005_f_port: app_layer_params.ts005_f_port as u8,
+                }
+            },
+            supported_uplink_data_rates: fields::DataRates::new(
+                req_dp
+                    .supported_uplink_data_rates
+                    .iter()
+                    .map(|&v| Some(v as i16))
+                    .collect(),
+            ),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| e.status())?;
+
+        let mut resp = Response::new(());
+        resp.metadata_mut()
+            .insert("x-log-device_profile_id", req_dp.id.parse().unwrap());
+
+        Ok(resp)
+    }
+
+    async fn delete(
+        &self,
+        request: Request<api::DeleteDeviceProfileRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.get_ref();
+        let dp_id = Uuid::from_str(&req.id).map_err(|e| e.status())?;
+
+        self.validator
+            .validate(
+                request.extensions(),
+                validator::ValidateDeviceProfileAccess::new(validator::Flag::Delete, dp_id),
+            )
+            .await?;
+
+        device_profile::delete(&dp_id)
+            .await
+            .map_err(|e| e.status())?;
+
+        let mut resp = Response::new(());
+        resp.metadata_mut()
+            .insert("x-log-device_profile_id", req.id.parse().unwrap());
+
+        Ok(resp)
+    }
+
+    async fn list(
+        &self,
+        request: Request<api::ListDeviceProfilesRequest>,
+    ) -> Result<Response<api::ListDeviceProfilesResponse>, Status> {
+        let req = request.get_ref();
+
+        let tenant_id = if req.tenant_id.is_empty() {
+            None
+        } else {
+            Some(Uuid::from_str(&req.tenant_id).map_err(|e| e.status())?)
+        };
+
+        let device_id = if req.device_id.is_empty() {
+            None
+        } else {
+            Some(Uuid::from_str(&req.device_id).map_err(|e| e.status())?)
+        };
+
+        self.validator
+            .validate(
+                request.extensions(),
+                validator::ValidateDeviceProfilesAccess::new(
+                    validator::Flag::List,
+                    tenant_id,
+                    req.global_only,
+                ),
+            )
+            .await?;
+
+        let filters = device_profile::Filters {
+            global_only: req.global_only,
+            tenant_only: req.tenant_only,
+            tenant_id: if !req.global_only { tenant_id } else { None },
+            device_id: if req.global_only { device_id } else { None },
+            search: if req.search.is_empty() {
+                None
+            } else {
+                Some(req.search.to_string())
+            },
+        };
+
+        let count = device_profile::get_count(&filters)
+            .await
+            .map_err(|e| e.status())?;
+        let items = device_profile::list(req.limit as i64, req.offset as i64, &filters)
+            .await
+            .map_err(|e| e.status())?;
+
+        let mut resp = Response::new(api::ListDeviceProfilesResponse {
+            total_count: count as u32,
+            result: items
+                .iter()
+                .map(|dp| api::DeviceProfileListItem {
+                    id: dp.id.to_string(),
+                    created_at: Some(helpers::datetime_to_prost_timestamp(&dp.created_at)),
+                    updated_at: Some(helpers::datetime_to_prost_timestamp(&dp.updated_at)),
+                    name: dp.name.clone(),
+                    region: dp.region.to_proto().into(),
+                    mac_version: dp.mac_version.to_proto().into(),
+                    reg_params_revision: dp.reg_params_revision.to_proto().into(),
+                    supports_otaa: dp.supports_otaa,
+                    supports_class_b: dp.supports_class_b,
+                    supports_class_c: dp.supports_class_c,
+                    vendor_id: dp.vendor_id.map(|v| v.to_string()).unwrap_or_default(),
+                    vendor_name: dp.vendor_name.clone().unwrap_or_default(),
+                    device_id: dp.device_id.map(|v| v.to_string()).unwrap_or_default(),
+                    device_name: dp.device_name.clone().unwrap_or_default(),
+                    firmware_version: dp.firmware_version.clone(),
+                })
+                .collect(),
+        });
+        resp.metadata_mut()
+            .insert("x-log-tenant_id", req.tenant_id.parse().unwrap());
+
+        Ok(resp)
+    }
+
+    async fn list_vendors(
+        &self,
+        request: Request<api::ListDeviceProfileVendorsRequest>,
+    ) -> Result<Response<api::ListDeviceProfileVendorsResponse>, Status> {
+        let req = request.get_ref();
+
+        self.validator
+            .validate(
+                request.extensions(),
+                validator::ValidateDeviceProfileVendorsAccess::new(validator::Flag::List),
+            )
+            .await?;
+
+        let count = device_profile::get_vendor_count()
+            .await
+            .map_err(|e| e.status())?;
+        let items = device_profile::list_vendors(req.limit as i64, req.offset as i64)
+            .await
+            .map_err(|e| e.status())?;
+
+        Ok(Response::new(api::ListDeviceProfileVendorsResponse {
+            total_count: count as u32,
+            result: items
+                .iter()
+                .map(|v| api::DeviceProfileVendorListItem {
+                    id: v.id.to_string(),
+                    created_at: Some(helpers::datetime_to_prost_timestamp(&v.created_at)),
+                    updated_at: Some(helpers::datetime_to_prost_timestamp(&v.updated_at)),
+                    name: v.name.clone(),
+                    vendor_id: v.vendor_id as u32,
+                    ouis: v
+                        .ouis
+                        .iter()
+                        .map(|v| v.clone().unwrap_or_default())
+                        .collect(),
+                    metadata: v.metadata.into_hashmap(),
+                })
+                .collect(),
+        }))
+    }
+
+    async fn get_vendor(
+        &self,
+        request: Request<api::GetDeviceProfileVendorRequest>,
+    ) -> Result<Response<api::GetDeviceProfileVendorResponse>, Status> {
+        let req = request.get_ref();
+        let vendor_id = Uuid::from_str(&req.id).map_err(|e| e.status())?;
+
+        self.validator
+            .validate(
+                request.extensions(),
+                validator::ValidateDeviceProfileVendorAccess::new(validator::Flag::Read),
+            )
+            .await?;
+
+        let v = device_profile::get_vendor(vendor_id)
+            .await
+            .map_err(|e| e.status())?;
+
+        let mut resp = Response::new(api::GetDeviceProfileVendorResponse {
+            vendor: Some(api::DeviceProfileVendor {
+                id: v.id.to_string(),
+                name: v.name.clone(),
+                vendor_id: v.vendor_id as u32,
+                ouis: v
+                    .ouis
+                    .iter()
+                    .cloned()
+                    .map(|v| v.unwrap_or_default())
+                    .collect(),
+                metadata: v.metadata.into_hashmap(),
+            }),
+            created_at: Some(helpers::datetime_to_prost_timestamp(&v.created_at)),
+            updated_at: Some(helpers::datetime_to_prost_timestamp(&v.updated_at)),
+        });
+
+        resp.metadata_mut()
+            .insert("x-log-vendor_id", req.id.parse().unwrap());
+
+        Ok(resp)
+    }
+
+    async fn delete_vendor(
+        &self,
+        request: Request<api::DeleteDeviceProfileVendorRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.get_ref();
+        let vendor_id = Uuid::from_str(&req.id).map_err(|e| e.status())?;
+
+        self.validator
+            .validate(
+                request.extensions(),
+                validator::ValidateDeviceProfileVendorAccess::new(validator::Flag::Delete),
+            )
+            .await?;
+
+        let _ = device_profile::delete_vendor(vendor_id)
+            .await
+            .map_err(|e| e.status())?;
+
+        let mut resp = Response::new(());
+
+        resp.metadata_mut()
+            .insert("x-log-vendor_id", req.id.parse().unwrap());
+
+        Ok(resp)
+    }
+
+    async fn get_device(
+        &self,
+        request: Request<api::GetDeviceProfileDeviceRequest>,
+    ) -> Result<Response<api::GetDeviceProfileDeviceResponse>, Status> {
+        let req = request.get_ref();
+        let device_id = Uuid::from_str(&req.id).map_err(|e| e.status())?;
+
+        self.validator
+            .validate(
+                request.extensions(),
+                validator::ValidateDeviceProfileDeviceAccess::new(validator::Flag::Read),
+            )
+            .await?;
+
+        let d = device_profile::get_device(device_id)
+            .await
+            .map_err(|e| e.status())?;
+
+        let mut resp = Response::new(api::GetDeviceProfileDeviceResponse {
+            device: Some(api::DeviceProfileDevice {
+                id: d.id.to_string(),
+                vendor_id: d.vendor_id.to_string(),
+                name: d.name.clone(),
+                description: d.description.clone(),
+                metadata: d.metadata.into_hashmap(),
+            }),
+            created_at: Some(helpers::datetime_to_prost_timestamp(&d.created_at)),
+            updated_at: Some(helpers::datetime_to_prost_timestamp(&d.updated_at)),
+        });
+
+        resp.metadata_mut()
+            .insert("x-log-device_id", req.id.parse().unwrap());
+        Ok(resp)
+    }
+
+    async fn list_devices(
+        &self,
+        request: Request<api::ListDeviceProfileDevicesRequest>,
+    ) -> Result<Response<api::ListDeviceProfileDevicesResponse>, Status> {
+        let req = request.get_ref();
+
+        let vendor_id = if req.vendor_id.is_empty() {
+            None
+        } else {
+            Some(Uuid::from_str(&req.vendor_id).map_err(|e| e.status())?)
+        };
+
+        self.validator
+            .validate(
+                request.extensions(),
+                validator::ValidateDeviceProfileDevicesAccess::new(validator::Flag::List),
+            )
+            .await?;
+
+        let filters = device_profile::DeviceFilters { vendor_id };
+
+        let count = device_profile::get_device_count(&filters)
+            .await
+            .map_err(|e| e.status())?;
+
+        let items = device_profile::list_devices(req.limit as i64, req.offset as i64, &filters)
+            .await
+            .map_err(|e| e.status())?;
+
+        Ok(Response::new(api::ListDeviceProfileDevicesResponse {
+            total_count: count as u32,
+            result: items
+                .iter()
+                .map(|v| api::DeviceProfileDeviceListItem {
+                    id: v.id.to_string(),
+                    created_at: Some(helpers::datetime_to_prost_timestamp(&v.created_at)),
+                    updated_at: Some(helpers::datetime_to_prost_timestamp(&v.updated_at)),
+                    name: v.name.clone(),
+                })
+                .collect(),
+        }))
+    }
+
+    async fn delete_device(
+        &self,
+        request: Request<api::DeleteDeviceProfileDeviceRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.get_ref();
+        let device_id = Uuid::from_str(&req.id).map_err(|e| e.status())?;
+
+        self.validator
+            .validate(
+                request.extensions(),
+                validator::ValidateDeviceProfileDeviceAccess::new(validator::Flag::Delete),
+            )
+            .await?;
+
+        let _ = device_profile::delete_device(device_id)
+            .await
+            .map_err(|e| e.status())?;
+
+        let mut resp = Response::new(());
+
+        resp.metadata_mut()
+            .insert("x-log-device_id", req.id.parse().unwrap());
+
+        Ok(resp)
+    }
+
+    async fn list_adr_algorithms(
+        &self,
+        request: Request<()>,
+    ) -> Result<Response<api::ListDeviceProfileAdrAlgorithmsResponse>, Status> {
+        self.validator
+            .validate(
+                request.extensions(),
+                validator::ValidateActiveUserOrKey::new(),
+            )
+            .await?;
+
+        let items = adr::get_algorithms().await;
+        let mut result: Vec<api::AdrAlgorithmListItem> = items
+            .iter()
+            .map(|(k, v)| api::AdrAlgorithmListItem {
+                id: k.clone(),
+                name: v.clone(),
+            })
+            .collect();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Ok(Response::new(api::ListDeviceProfileAdrAlgorithmsResponse {
+            total_count: items.len() as u32,
+            result,
+        }))
+    }
+}
+
+#[cfg(test)]
+pub mod test {
+    use super::*;
+    use crate::api::auth::AuthID;
+    use crate::api::auth::validator::RequestValidator;
+    use crate::storage::{tenant, user};
+    use crate::test;
+    use chirpstack_api::common;
+
+    #[tokio::test]
+    async fn test_device_profile() {
+        let _guard = test::prepare().await;
+
+        // setup admin user
+        let u = user::User {
+            is_admin: true,
+            is_active: true,
+            email: "admin@admin".into(),
+            email_verified: true,
+            ..Default::default()
+        };
+        let u = user::create(u).await.unwrap();
+
+        // create tenant
+        let t = tenant::create(tenant::Tenant {
+            name: "test-tenant".into(),
+            can_have_gateways: true,
+            max_gateway_count: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // create dp vendor
+        let dp_vendor = device_profile::upsert_vendor(device_profile::Vendor {
+            name: "test-vendor".into(),
+            vendor_id: 123,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // create dp device
+        let dp_device = device_profile::upsert_device(device_profile::Device {
+            name: "test-device".into(),
+            vendor_id: dp_vendor.id,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // create
+        let dp_vendor = device_profile::create(device_profile::DeviceProfile {
+            name: "test-vendor-dp".into(),
+            device_id: Some(dp_device.id),
+            vendor_profile_id: 456,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // setup the api
+        let service = DeviceProfile::new(RequestValidator::new());
+
+        // create
+        let create_req = get_request(
+            &u.id,
+            api::CreateDeviceProfileRequest {
+                device_profile: Some(api::DeviceProfile {
+                    tenant_id: t.id.to_string(),
+                    name: "test-dp".into(),
+                    region: common::Region::Eu868.into(),
+                    mac_version: common::MacVersion::Lorawan103.into(),
+                    reg_params_revision: common::RegParamsRevision::A.into(),
+                    adr_algorithm_id: "default".into(),
+                    ..Default::default()
+                }),
+            },
+        );
+        let create_resp = service.create(create_req).await.unwrap();
+        let dp_id = Uuid::from_str(&create_resp.get_ref().id).unwrap();
+
+        // get
+        let get_req = get_request(
+            &u.id,
+            api::GetDeviceProfileRequest {
+                id: dp_id.to_string(),
+            },
+        );
+        let get_resp = service.get(get_req).await.unwrap();
+        assert_eq!(
+            Some(api::DeviceProfile {
+                id: dp_id.to_string(),
+                tenant_id: t.id.to_string(),
+                name: "test-dp".into(),
+                region: common::Region::Eu868.into(),
+                mac_version: common::MacVersion::Lorawan103.into(),
+                reg_params_revision: common::RegParamsRevision::A.into(),
+                adr_algorithm_id: "default".into(),
+                app_layer_params: Some(api::AppLayerParams {
+                    ts003_version: api::Ts003Version::Ts003NotImplemented.into(),
+                    ts003_f_port: 202,
+                    ts004_version: api::Ts004Version::Ts004NotImplemented.into(),
+                    ts004_f_port: 201,
+                    ts005_version: api::Ts005Version::Ts005NotImplemented.into(),
+                    ts005_f_port: 200,
+                }),
+                ..Default::default()
+            }),
+            get_resp.get_ref().device_profile
+        );
+
+        // get_by_profile_id
+        let get_req = get_request(
+            &u.id,
+            api::GetDeviceProfileByProfileIdRequest {
+                vendor_id: 123,
+                vendor_profile_id: 456,
+            },
+        );
+        let get_resp = service.get_by_profile_id(get_req).await.unwrap();
+        assert_eq!(
+            dp_vendor.id.to_string(),
+            get_resp.get_ref().device_profile.clone().unwrap().id
+        );
+
+        // update
+        let update_req = get_request(
+            &u.id,
+            api::UpdateDeviceProfileRequest {
+                device_profile: Some(api::DeviceProfile {
+                    id: dp_id.to_string(),
+                    tenant_id: t.id.to_string(),
+                    name: "test-dp-updated".into(),
+                    region: common::Region::Us915.into(),
+                    mac_version: common::MacVersion::Lorawan103.into(),
+                    reg_params_revision: common::RegParamsRevision::A.into(),
+                    adr_algorithm_id: "default".into(),
+                    ..Default::default()
+                }),
+            },
+        );
+        let _ = service.update(update_req).await.unwrap();
+
+        // get
+        let get_req = get_request(
+            &u.id,
+            api::GetDeviceProfileRequest {
+                id: dp_id.to_string(),
+            },
+        );
+        let get_resp = service.get(get_req).await.unwrap();
+        assert_eq!(
+            Some(api::DeviceProfile {
+                id: dp_id.to_string(),
+                tenant_id: t.id.to_string(),
+                name: "test-dp-updated".into(),
+                region: common::Region::Us915.into(),
+                mac_version: common::MacVersion::Lorawan103.into(),
+                reg_params_revision: common::RegParamsRevision::A.into(),
+                adr_algorithm_id: "default".into(),
+                app_layer_params: Some(api::AppLayerParams::default()),
+                ..Default::default()
+            }),
+            get_resp.get_ref().device_profile
+        );
+
+        // list
+        let list_req = get_request(
+            &u.id,
+            api::ListDeviceProfilesRequest {
+                tenant_id: t.id.to_string(),
+                limit: 10,
+                search: "update".into(),
+                ..Default::default()
+            },
+        );
+        let list_resp = service.list(list_req).await.unwrap();
+        let list_resp = list_resp.get_ref();
+        assert_eq!(1, list_resp.total_count);
+        assert_eq!(1, list_resp.result.len());
+        assert_eq!(dp_id.to_string(), list_resp.result[0].id);
+
+        // delete
+        let del_req = get_request(
+            &u.id,
+            api::DeleteDeviceProfileRequest {
+                id: dp_id.to_string(),
+            },
+        );
+        let _ = service.delete(del_req).await.unwrap();
+        let del_req = get_request(
+            &u.id,
+            api::DeleteDeviceProfileRequest {
+                id: dp_id.to_string(),
+            },
+        );
+        let del_resp = service.delete(del_req).await;
+        assert!(del_resp.is_err());
+
+        // list adr algorithms
+        let list_adr_algs_req = get_request(&u.id, ());
+        let list_adr_algs_resp = service
+            .list_adr_algorithms(list_adr_algs_req)
+            .await
+            .unwrap();
+        let list_adr_algs_resp = list_adr_algs_resp.get_ref();
+        assert_eq!(3, list_adr_algs_resp.total_count);
+        assert_eq!(3, list_adr_algs_resp.result.len());
+        assert_eq!("default", list_adr_algs_resp.result[0].id);
+        assert_eq!("lr_fhss", list_adr_algs_resp.result[1].id);
+        assert_eq!("lora_lr_fhss", list_adr_algs_resp.result[2].id);
+
+        // list vendors
+        let list_req = get_request(
+            &u.id,
+            api::ListDeviceProfileVendorsRequest {
+                limit: 10,
+                offset: 0,
+            },
+        );
+        let list_resp = service.list_vendors(list_req).await.unwrap();
+        let list_resp = list_resp.get_ref();
+        assert_eq!(1, list_resp.total_count);
+        assert_eq!("test-vendor", list_resp.result[0].name);
+        let dp_vendor_id = list_resp.result[0].id.clone();
+
+        // get vendor
+        let get_req = get_request(
+            &u.id,
+            api::GetDeviceProfileVendorRequest {
+                id: dp_vendor_id.clone(),
+            },
+        );
+        let get_resp = service.get_vendor(get_req).await.unwrap();
+        let get_resp = get_resp.get_ref();
+        assert_eq!(get_resp.vendor.as_ref().unwrap().id, dp_vendor_id);
+
+        // list devices
+        let list_req = get_request(
+            &u.id,
+            api::ListDeviceProfileDevicesRequest {
+                limit: 10,
+                offset: 0,
+                vendor_id: dp_vendor_id.clone(),
+            },
+        );
+        let list_resp = service.list_devices(list_req).await.unwrap();
+        let list_resp = list_resp.get_ref();
+        assert_eq!(1, list_resp.total_count);
+        assert_eq!("test-device", list_resp.result[0].name);
+        let dp_device_id = list_resp.result[0].id.clone();
+
+        // get device
+        let get_req = get_request(
+            &u.id,
+            api::GetDeviceProfileDeviceRequest {
+                id: dp_device_id.clone(),
+            },
+        );
+        let get_resp = service.get_device(get_req).await.unwrap();
+        let get_resp = get_resp.get_ref();
+        assert_eq!(get_resp.device.as_ref().unwrap().id, dp_device_id);
+
+        // delete device
+        let del_req = get_request(
+            &u.id,
+            api::DeleteDeviceProfileDeviceRequest { id: dp_device_id },
+        );
+        let _ = service.delete_device(del_req).await.unwrap();
+        let list_req = get_request(
+            &u.id,
+            api::ListDeviceProfileDevicesRequest {
+                limit: 10,
+                offset: 0,
+                vendor_id: dp_vendor_id.clone(),
+            },
+        );
+        let list_resp = service.list_devices(list_req).await.unwrap();
+        let list_resp = list_resp.get_ref();
+        assert_eq!(0, list_resp.total_count);
+
+        // delete vendor
+        let del_req = get_request(
+            &u.id,
+            api::DeleteDeviceProfileVendorRequest { id: dp_vendor_id },
+        );
+        let _ = service.delete_vendor(del_req).await.unwrap();
+        let list_req = get_request(
+            &u.id,
+            api::ListDeviceProfileVendorsRequest {
+                limit: 10,
+                offset: 0,
+            },
+        );
+        let list_resp = service.list_vendors(list_req).await.unwrap();
+        let list_resp = list_resp.get_ref();
+        assert_eq!(0, list_resp.total_count);
+    }
+
+    fn get_request<T>(user_id: &Uuid, req: T) -> Request<T> {
+        let mut req = Request::new(req);
+        req.extensions_mut().insert(AuthID::User(*user_id));
+        req
+    }
+}

@@ -1,0 +1,45 @@
+import { Link, useNavigate } from "react-router";
+
+import { Space, Breadcrumb, Card } from "antd";
+
+import type { CreateTenantResponse } from "@chirpstack/chirpstack-api-grpc-web/api/tenant_pb";
+import { Tenant, CreateTenantRequest } from "@chirpstack/chirpstack-api-grpc-web/api/tenant_pb";
+
+import TenantForm from "./TenantForm";
+import TenantStore from "../../stores/TenantStore";
+import { useTitle } from "../helpers";
+import PageHeader from "../../components/PageHeader";
+
+function CreateTenant() {
+  useTitle("Network Server", "Tenants", "Add");
+  const navigate = useNavigate();
+
+  const onFinish = (obj: Tenant) => {
+    const req = new CreateTenantRequest();
+    req.setTenant(obj);
+
+    TenantStore.create(req, (resp: CreateTenantResponse) => {
+      navigate(`/tenants/${resp.getId()}`);
+    });
+  };
+
+  const tenant = new Tenant();
+
+  return (
+    <Space orientation="vertical" style={{ width: "100%" }} size="large">
+      <PageHeader
+        breadcrumbRender={() => (
+          <Breadcrumb
+            items={[{ title: "Network Server" }, { title: <Link to="/tenants">Tenants</Link> }, { title: "Add" }]}
+          />
+        )}
+        title="Add tenant"
+      />
+      <Card>
+        <TenantForm initialValues={tenant} onFinish={onFinish} />
+      </Card>
+    </Space>
+  );
+}
+
+export default CreateTenant;

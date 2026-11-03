@@ -1,0 +1,76 @@
+import { Routes, Route, Link, useNavigate, useLocation } from "react-router";
+
+import { Space, Breadcrumb, Menu, Card, Button } from "antd";
+
+import type { Tenant } from "@chirpstack/chirpstack-api-grpc-web/api/tenant_pb";
+import { DeleteTenantRequest } from "@chirpstack/chirpstack-api-grpc-web/api/tenant_pb";
+
+import TenantStore from "../../stores/TenantStore";
+import DeleteConfirm from "../../components/DeleteConfirm";
+import SessionStore from "../../stores/SessionStore";
+import Admin from "../../components/Admin";
+import EditTenant from "./EditTenant";
+import TenantDashboard from "./TenantDashboard";
+import { useTitle } from "../helpers";
+import PageHeader from "../../components/PageHeader";
+
+function TenantLayout({ tenant }: { tenant: Tenant }) {
+  useTitle("Tenants", tenant.getName());
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  const deleteTenant = () => {
+    const req = new DeleteTenantRequest();
+    req.setId(tenant.getId());
+
+    TenantStore.delete(req, () => {
+      SessionStore.setTenantId("");
+      navigate("/tenants");
+    });
+  };
+
+  let tab = "dashboard";
+  if (location.pathname.endsWith("/edit")) {
+    tab = "edit";
+  }
+
+  return (
+    <Space orientation="vertical" style={{ width: "100%" }} size="large">
+      <PageHeader
+        breadcrumbRender={() => <Breadcrumb items={[{ title: "Tenants" }, { title: tenant.getName() }]} />}
+        title={tenant.getName()}
+        subTitle={`tenant id: ${tenant.getId()}`}
+        extra={[
+          <Admin key="delete-tenant">
+            <DeleteConfirm confirm={tenant.getName()} typ="tenant" onConfirm={deleteTenant}>
+              <Button danger type="primary">
+                Delete tenant
+              </Button>
+            </DeleteConfirm>
+          </Admin>,
+        ]}
+      />
+
+      <Card>
+        <Menu
+          mode="horizontal"
+          selectedKeys={[tab]}
+          style={{ marginBottom: 24 }}
+          items={[
+            { key: "dashboard", label: <Link to={`/tenants/${tenant.getId()}`}>Dashboard</Link> },
+            {
+              key: "edit",
+              label: <Link to={`/tenants/${tenant.getId()}/edit`}>Configuration</Link>,
+            },
+          ]}
+        />
+        <Routes>
+          <Route path="/" element={<TenantDashboard tenant={tenant} />} />
+          <Route path="/edit" element={<EditTenant tenant={tenant} />} />
+        </Routes>
+      </Card>
+    </Space>
+  );
+}
+
+export default TenantLayout;

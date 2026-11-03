@@ -1,0 +1,151 @@
+import { Link } from "react-router";
+
+import { Space, Breadcrumb, Button } from "antd";
+import type { ColumnsType } from "antd/es/table";
+
+import type {
+  ListDeviceProfilesResponse,
+  DeviceProfileListItem,
+} from "@chirpstack/chirpstack-api-grpc-web/api/device_profile_pb";
+import { ListDeviceProfilesRequest } from "@chirpstack/chirpstack-api-grpc-web/api/device_profile_pb";
+import type { Tenant } from "@chirpstack/chirpstack-api-grpc-web/api/tenant_pb";
+import { Region } from "@chirpstack/chirpstack-api-grpc-web/common/common_pb";
+
+import { getEnumName, formatMacVersion, formatRegParamsRevision } from "../helpers";
+import type { GetPageCallbackFunc } from "../../components/DataTable";
+import DataTable from "../../components/DataTable";
+import DeviceProfileStore from "../../stores/DeviceProfileStore";
+import Admin from "../../components/Admin";
+import { useTitle } from "../helpers";
+import PageHeader from "../../components/PageHeader";
+
+interface IProps {
+  tenant: Tenant;
+}
+
+function ListDeviceProfiles(props: IProps) {
+  useTitle("Tenants", props.tenant.getName(), "Device profiles");
+  const columns: ColumnsType<DeviceProfileListItem.AsObject> = [
+    {
+      title: "Name",
+      dataIndex: "name",
+      key: "name",
+      render: (text, record) => (
+        <Link to={`/tenants/${props.tenant.getId()}/device-profiles/${record.id}/edit`}>{text}</Link>
+      ),
+    },
+    {
+      title: "Region",
+      dataIndex: "region",
+      key: "region",
+      width: 150,
+      render: (text, record) => {
+        return getEnumName(Region, record.region);
+      },
+    },
+    {
+      title: "MAC version",
+      dataIndex: "macVersion",
+      key: "macVersion",
+      width: 150,
+      render: (text, record) => {
+        return formatMacVersion(record.macVersion);
+      },
+    },
+    {
+      title: "Revision",
+      dataIndex: "regParamsRevision",
+      key: "regParamsRevision",
+      width: 150,
+      render: (text, record) => {
+        return formatRegParamsRevision(record.regParamsRevision);
+      },
+    },
+    {
+      title: "Supports OTAA",
+      dataIndex: "supportsOtaa",
+      key: "supportsOtaa",
+      width: 150,
+      render: (text, record) => {
+        if (record.supportsOtaa) {
+          return "yes";
+        } else {
+          return "no";
+        }
+      },
+    },
+    {
+      title: "Supports Class-B",
+      dataIndex: "supportsClassB",
+      key: "supportsClassB",
+      width: 150,
+      render: (text, record) => {
+        if (record.supportsClassB) {
+          return "yes";
+        } else {
+          return "no";
+        }
+      },
+    },
+    {
+      title: "Supports Class-C",
+      dataIndex: "supportsClassC",
+      key: "supportsClassC",
+      width: 150,
+      render: (text, record) => {
+        if (record.supportsClassC) {
+          return "yes";
+        } else {
+          return "no";
+        }
+      },
+    },
+  ];
+
+  const getPage = (
+    limit: number,
+    offset: number,
+    _filters: object,
+    orderBy: string | void,
+    orderByDesc: boolean | void,
+    callbackFunc: GetPageCallbackFunc,
+  ) => {
+    const req = new ListDeviceProfilesRequest();
+    req.setTenantId(props.tenant.getId());
+    req.setTenantOnly(true);
+    req.setLimit(limit);
+    req.setOffset(offset);
+
+    DeviceProfileStore.list(req, (resp: ListDeviceProfilesResponse) => {
+      const obj = resp.toObject();
+      callbackFunc(obj.totalCount, obj.resultList);
+    });
+  };
+
+  return (
+    <Space orientation="vertical" style={{ width: "100%" }} size="large">
+      <PageHeader
+        breadcrumbRender={() => (
+          <Breadcrumb
+            items={[
+              { title: "Tenants" },
+              { title: <Link to={`/tenants/${props.tenant.getId()}`}>{props.tenant.getName()}</Link> },
+              { title: "Device profiles" },
+            ]}
+          />
+        )}
+        title="Device profiles"
+        extra={[
+          <Admin tenantId={props.tenant.getId()} isDeviceAdmin key="add-device-profile">
+            <Button type="primary">
+              <Link to={`/tenants/${props.tenant.getId()}/device-profiles/create`}>Add device profile</Link>
+            </Button>
+          </Admin>,
+        ]}
+      />
+      <DataTable columns={columns} getPage={getPage} rowKey="id" />
+    </Space>
+  );
+}
+
+export default ListDeviceProfiles;

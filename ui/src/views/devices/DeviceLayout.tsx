@@ -1,0 +1,248 @@
+import { useState, useEffect } from "react";
+import { Route, Routes, useParams, Link, useNavigate, useLocation } from "react-router";
+
+import { Space, Breadcrumb, Card, Button, Menu } from "antd";
+
+import type { Tenant } from "@chirpstack/chirpstack-api-grpc-web/api/tenant_pb";
+import type { Application } from "@chirpstack/chirpstack-api-grpc-web/api/application_pb";
+import type {
+  DeviceProfile,
+  GetDeviceProfileResponse,
+} from "@chirpstack/chirpstack-api-grpc-web/api/device_profile_pb";
+import { GetDeviceProfileRequest } from "@chirpstack/chirpstack-api-grpc-web/api/device_profile_pb";
+import type { Device, GetDeviceResponse } from "@chirpstack/chirpstack-api-grpc-web/api/device_pb";
+import { GetDeviceRequest, DeleteDeviceRequest } from "@chirpstack/chirpstack-api-grpc-web/api/device_pb";
+
+import DeviceStore from "../../stores/DeviceStore";
+import DeviceProfileStore from "../../stores/DeviceProfileStore";
+import DeleteConfirm from "../../components/DeleteConfirm";
+import PageHeader from "../../components/PageHeader";
+import Admin from "../../components/Admin";
+
+import DeviceDashboard from "./DeviceDashboard";
+import EditDevice from "./EditDevice";
+import SetDeviceKeys from "./SetDeviceKeys";
+import DeviceFrames from "./DeviceFrames";
+import DeviceEvents from "./DeviceEvents";
+import DeviceQueue from "./DeviceQueue";
+import DeviceActivation from "./DeviceActivation";
+import { useTitle } from "../helpers";
+
+interface IProps {
+  tenant: Tenant;
+  application: Application;
+}
+
+function DeviceLayout(props: IProps) {
+  const { devEui } = useParams();
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  const [device, setDevice] = useState<Device | undefined>(undefined);
+  const [deviceProfile, setDeviceProfile] = useState<DeviceProfile | undefined>(undefined);
+  const [lastSeenAt, setLastSeenAt] = useState<Date | undefined>(undefined);
+  useTitle(
+    "Tenants",
+    props.tenant.getName(),
+    "Applications",
+    props.application.getName(),
+    "Devices",
+    device?.getName(),
+  );
+
+  useEffect(() => {
+    const loadDevice = () => {
+      const req = new GetDeviceRequest();
+      req.setDevEui(devEui!);
+
+      DeviceStore.get(req, (resp: GetDeviceResponse) => {
+        setDevice(resp.getDevice());
+
+        if (resp.getLastSeenAt() !== undefined) {
+          setLastSeenAt(resp.getLastSeenAt()!.toDate());
+        }
+
+        const req = new GetDeviceProfileRequest();
+        req.setId(resp.getDevice()!.getDeviceProfileId());
+        DeviceProfileStore.get(req, (resp: GetDeviceProfileResponse) => {
+          setDeviceProfile(resp.getDeviceProfile());
+        });
+      });
+    };
+
+    DeviceStore.on("change", loadDevice);
+    loadDevice();
+
+    return () => {
+      DeviceStore.removeAllListeners("change");
+    };
+  }, [devEui]);
+
+  const deleteDevice = () => {
+    const req = new DeleteDeviceRequest();
+    req.setDevEui(devEui!);
+
+    DeviceStore.delete(req, () => {
+      navigate(`/tenants/${props.tenant.getId()}/applications/${props.application.getId()}`);
+    });
+  };
+
+  const dp = deviceProfile;
+  if (!device || !dp) {
+    return null;
+  }
+
+  const tenant = props.tenant;
+  const app = props.application;
+
+  const path = location.pathname;
+  let tab = "dashboard";
+
+  if (path.endsWith("edit")) {
+    tab = "edit";
+  }
+  if (path.endsWith("queue")) {
+    tab = "queue";
+  }
+  if (path.endsWith("keys")) {
+    tab = "keys";
+  }
+  if (path.endsWith("activation")) {
+    tab = "activation";
+  }
+  if (path.endsWith("events")) {
+    tab = "events";
+  }
+  if (path.endsWith("frames")) {
+    tab = "frames";
+  }
+
+  return (
+    <Space orientation="vertical" style={{ width: "100%" }} size="large">
+      <PageHeader
+        breadcrumbRender={() => (
+          <Breadcrumb
+            items={[
+              { title: "Tenants" },
+              { title: <Link to={`/tenants/${props.tenant.getId()}`}>{props.tenant.getName()}</Link> },
+              { title: <Link to={`/tenants/${props.tenant.getId()}/applications`}>Applications</Link> },
+              {
+                title: (
+                  <Link to={`/tenants/${props.tenant.getId()}/applications/${props.application.getId()}`}>
+                    {props.application.getName()}
+                  </Link>
+                ),
+              },
+              {
+                title: (
+                  <Link to={`/tenants/${props.tenant.getId()}/applications/${props.application.getId()}`}>Devices</Link>
+                ),
+              },
+              { title: device.getName() },
+            ]}
+          />
+        )}
+        title={device.getName()}
+        subTitle={`device eui: ${device.getDevEui()}`}
+        extra={[
+          <Admin tenantId={props.tenant.getId()} isDeviceAdmin key="delete-device">
+            <DeleteConfirm typ="device" confirm={device.getName()} onConfirm={deleteDevice}>
+              <Button danger type="primary">
+                Delete device
+              </Button>
+            </DeleteConfirm>
+          </Admin>,
+        ]}
+      />
+      <Card>
+        <Menu
+          mode="horizontal"
+          selectedKeys={[tab]}
+          style={{ marginBottom: 24 }}
+          items={[
+            {
+              key: "dashboard",
+              label: (
+                <Link to={`/tenants/${tenant.getId()}/applications/${app.getId()}/devices/${device.getDevEui()}`}>
+                  Dashboard
+                </Link>
+              ),
+            },
+            {
+              key: "edit",
+              label: (
+                <Link to={`/tenants/${tenant.getId()}/applications/${app.getId()}/devices/${device.getDevEui()}/edit`}>
+                  Configuration
+                </Link>
+              ),
+            },
+            {
+              key: "keys",
+              disabled: !dp.getSupportsOtaa(),
+              label: (
+                <Link to={`/tenants/${tenant.getId()}/applications/${app.getId()}/devices/${device.getDevEui()}/keys`}>
+                  OTAA keys
+                </Link>
+              ),
+            },
+            {
+              key: "activation",
+              label: (
+                <Link
+                  to={`/tenants/${tenant.getId()}/applications/${app.getId()}/devices/${device.getDevEui()}/activation`}
+                >
+                  Activation
+                </Link>
+              ),
+            },
+            {
+              key: "queue",
+              label: (
+                <Link to={`/tenants/${tenant.getId()}/applications/${app.getId()}/devices/${device.getDevEui()}/queue`}>
+                  Queue
+                </Link>
+              ),
+            },
+            {
+              key: "events",
+              label: (
+                <Link
+                  to={`/tenants/${tenant.getId()}/applications/${app.getId()}/devices/${device.getDevEui()}/events`}
+                >
+                  Events
+                </Link>
+              ),
+            },
+            {
+              key: "frames",
+              label: (
+                <Link
+                  to={`/tenants/${tenant.getId()}/applications/${app.getId()}/devices/${device.getDevEui()}/frames`}
+                >
+                  LoRaWAN frames
+                </Link>
+              ),
+            },
+          ]}
+        />
+        <Routes>
+          <Route path="/" element={<DeviceDashboard device={device} lastSeenAt={lastSeenAt} deviceProfile={dp} />} />
+          <Route path="/edit" element={<EditDevice device={device} application={app} tenant={tenant} />} />
+          <Route
+            path="/keys"
+            element={<SetDeviceKeys device={device} application={app} tenant={tenant} deviceProfile={dp} />}
+          />
+          <Route path="/frames" element={<DeviceFrames device={device} />} />
+          <Route path="/events" element={<DeviceEvents device={device} />} />
+          <Route path="/queue" element={<DeviceQueue device={device} />} />
+          <Route
+            path="/activation"
+            element={<DeviceActivation device={device} deviceProfile={dp} tenant={tenant} application={app} />}
+          />
+        </Routes>
+      </Card>
+    </Space>
+  );
+}
+
+export default DeviceLayout;

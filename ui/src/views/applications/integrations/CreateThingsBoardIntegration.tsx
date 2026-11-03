@@ -1,0 +1,41 @@
+import { useNavigate } from "react-router";
+
+import { Card } from "antd";
+
+import type { Application } from "@chirpstack/chirpstack-api-grpc-web/api/application_pb";
+import {
+  ThingsBoardIntegration,
+  CreateThingsBoardIntegrationRequest,
+} from "@chirpstack/chirpstack-api-grpc-web/api/application_pb";
+
+import ThingsBoardIntegrationForm from "./ThingsBoardIntegrationForm";
+import ApplicationStore from "../../../stores/ApplicationStore";
+
+interface IProps {
+  application: Application;
+}
+
+function CreateThingsBoardIntegration(props: IProps) {
+  const navigate = useNavigate();
+
+  const onFinish = (obj: ThingsBoardIntegration) => {
+    obj.setApplicationId(props.application.getId());
+
+    const req = new CreateThingsBoardIntegrationRequest();
+    req.setIntegration(obj);
+
+    ApplicationStore.createThingsBoardIntegration(req, () => {
+      navigate(`/tenants/${props.application.getTenantId()}/applications/${props.application.getId()}/integrations`);
+    });
+  };
+
+  const i = new ThingsBoardIntegration();
+
+  return (
+    <Card title="Add ThingsBoard integration">
+      <ThingsBoardIntegrationForm initialValues={i} onFinish={onFinish} />
+    </Card>
+  );
+}
+
+export default CreateThingsBoardIntegration;

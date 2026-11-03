@@ -1,0 +1,259 @@
+[package]
+  name = "chirpstack"
+  description = "ChirpStack is an open-source LoRaWAN(TM) Network Server"
+  publish = false
+  homepage.workspace = true
+  license.workspace = true
+  version.workspace = true
+  authors.workspace = true
+  edition.workspace = true
+  repository.workspace = true
+
+[dependencies]
+  # CLI interface
+  clap.workspace = true
+
+  # Configuration
+  serde.workspace = true
+  serde_yaml.workspace = true
+  serde_json.workspace = true
+  serde_urlencoded.workspace = true
+  humantime-serde.workspace = true
+  toml.workspace = true
+  handlebars.workspace = true
+  validator.workspace = true
+
+  # Database
+  diesel = { workspace = true, features = [
+    "chrono",
+    "numeric",
+    "64-column-tables",
+  ] }
+  diesel_migrations.workspace = true
+  diesel-async.workspace = true
+  tokio-postgres = { workspace = true, optional = true }
+  tokio-postgres-rustls = { workspace = true, optional = true }
+  bigdecimal.workspace = true
+  redis.workspace = true
+  deadpool-redis.workspace = true
+
+  # Logging
+  tracing.workspace = true
+  tracing-subscriber.workspace = true
+
+  # ChirpStack API definitions
+  chirpstack_api = { path = "../api/rust", features = [
+    "default",
+    "internal",
+    "server",
+  ] }
+  lrwn = { path = "../lrwn", features = [
+    "serde",
+    "diesel",
+    "regions",
+    "crypto",
+    "applayer",
+  ] }
+  backend = { path = "../backend" }
+
+  # HTTP
+  reqwest.workspace = true
+
+  # Integrations
+  aws-sign-v4.workspace = true
+  hmac.workspace = true
+  sha2.workspace = true
+  urlencoding.workspace = true
+  geohash.workspace = true
+  gcp_auth.workspace = true
+  lapin.workspace = true
+  tokio-executor-trait.workspace = true
+  tokio-reactor-trait.workspace = true
+  rdkafka.workspace = true
+  rdkafka-sys.workspace = true
+
+  # gRPC and Protobuf
+  tonic-web.workspace = true
+  tonic-reflection.workspace = true
+  tokio = { workspace = true, features = ["rt-multi-thread"] }
+  tokio-stream.workspace = true
+  prost-types.workspace = true
+  prost.workspace = true
+  pbjson-types.workspace = true
+
+  # gRPC and HTTP multiplexing
+  axum.workspace = true
+  axum-server.workspace = true
+  tower.workspace = true
+  futures.workspace = true
+  futures-util.workspace = true
+  http.workspace = true
+  http-body.workspace = true
+  rust-embed.workspace = true
+  mime_guess.workspace = true
+  url.workspace = true
+  tower-http.workspace = true
+
+  # Error handling
+  thiserror.workspace = true
+  anyhow.workspace = true
+
+  # Authentication
+  pbkdf2.workspace = true
+  jsonwebtoken.workspace = true
+  rustls.workspace = true
+  rustls-native-certs.workspace = true
+  rustls-pemfile.workspace = true
+  pem.workspace = true
+  x509-parser.workspace = true
+  rsa.workspace = true
+  p256.workspace = true
+  rcgen.workspace = true
+  oauth2.workspace = true
+  openidconnect.workspace = true
+
+  # MQTT
+  rumqttc.workspace = true
+  hex.workspace = true
+
+  # Codecs
+  rquickjs.workspace = true
+
+  # Misc
+  uuid.workspace = true
+  chrono.workspace = true
+  async-trait.workspace = true
+  aes.workspace = true
+  rand.workspace = true
+  base64.workspace = true
+  async-recursion.workspace = true
+  regex.workspace = true
+  petgraph.workspace = true
+  prometheus-client.workspace = true
+  pin-project.workspace = true
+  signal-hook.workspace = true
+  signal-hook-tokio.workspace = true
+  rpassword.workspace = true
+
+# Development and testing
+[dev-dependencies]
+  httpmock.workspace = true
+  bytes.workspace = true
+  dotenv.workspace = true
+
+[features]
+  default = ["postgres"]
+  postgres = [
+    "tokio-postgres",
+    "tokio-postgres-rustls",
+    "diesel/postgres_backend",
+    "diesel/serde_json",
+    "diesel/uuid",
+    "diesel-async/postgres",
+    "lrwn/postgres",
+  ]
+  sqlite = [
+    "diesel/sqlite",
+    "diesel/returning_clauses_for_sqlite_3_35",
+    "lrwn/sqlite",
+    "diesel-async/sync-connection-wrapper",
+    "diesel-async/sqlite",
+  ]
+  test-all-integrations = [
+    "test-integration-amqp",
+    "test-integration-kafka",
+    "test-integration-mqtt",
+  ]
+  test-integration-amqp = []
+  test-integration-kafka = []
+  test-integration-mqtt = []
+
+  # Debian packaging.
+  [package.metadata.deb]
+    assets = [
+      [
+        "target/release/chirpstack",
+        "usr/bin/",
+        "755",
+      ],
+      [
+        "configuration/*.toml",
+        "etc/chirpstack/",
+        "640",
+      ],
+    ]
+    conf-files = [
+      "/etc/chirpstack/chirpstack.toml",
+      "/etc/chirpstack/region_as923.toml",
+      "/etc/chirpstack/region_as923_2.toml",
+      "/etc/chirpstack/region_as923_3.toml",
+      "/etc/chirpstack/region_as923_4.toml",
+      "/etc/chirpstack/region_au915_0.toml",
+      "/etc/chirpstack/region_au915_1.toml",
+      "/etc/chirpstack/region_au915_2.toml",
+      "/etc/chirpstack/region_au915_3.toml",
+      "/etc/chirpstack/region_au915_4.toml",
+      "/etc/chirpstack/region_au915_5.toml",
+      "/etc/chirpstack/region_au915_6.toml",
+      "/etc/chirpstack/region_au915_7.toml",
+      "/etc/chirpstack/region_cn779.toml",
+      "/etc/chirpstack/region_eu433.toml",
+      "/etc/chirpstack/region_eu868.toml",
+      "/etc/chirpstack/region_in865.toml",
+      "/etc/chirpstack/region_ism2400.toml",
+      "/etc/chirpstack/region_kr920.toml",
+      "/etc/chirpstack/region_ru864.toml",
+      "/etc/chirpstack/region_us915_0.toml",
+      "/etc/chirpstack/region_us915_1.toml",
+      "/etc/chirpstack/region_us915_2.toml",
+      "/etc/chirpstack/region_us915_3.toml",
+      "/etc/chirpstack/region_us915_4.toml",
+      "/etc/chirpstack/region_us915_5.toml",
+      "/etc/chirpstack/region_us915_6.toml",
+      "/etc/chirpstack/region_us915_7.toml",
+    ]
+    suggests = "postgresql, mosquitto, redis"
+    conflicts = "chirpstack-sqlite"
+    maintainer-scripts = "debian/"
+    systemd-units = { enable = true }
+
+    [package.metadata.deb.variants.sqlite]
+      name = "chirpstack-sqlite"
+      suggests = "mosquitto, redis"
+      conflicts = "chirpstack"
+
+  [package.metadata.generate-rpm]
+    auto-req = "no"
+
+    pre_install_script = '''
+id chirpstack &>/dev/null
+if [[ $? -ne 0 ]]; then
+	useradd --system -U -M chirpstack -s /bin/false -d /etc/chirpstack
+fi
+'''
+
+    post_install_script = '''
+chown -R chirpstack:chirpstack /etc/chirpstack
+chmod 750 /etc/chirpstack
+chmod 640 /etc/chirpstack/*.toml
+'''
+
+    assets = [
+      { source = "target/release/chirpstack", dest = "/usr/bin/chirpstack", mode = "755" },
+      { source = "configuration/*", dest = "/etc/chirpstack" },
+      { source = "rpm/chirpstack.service", dest = "/lib/systemd/system/chirpstack.service" },
+    ]
+
+    [package.metadata.generate-rpm.conflicts]
+      chirpstack-sqlite = "*"
+
+    [package.metadata.generate-rpm.variants.sqlite]
+      name = "chirpstack-sqlite"
+      assets = [
+        { source = "target/release/chirpstack", dest = "/usr/bin/chirpstack", mode = "755" },
+        { source = "configuration/*", dest = "/etc/chirpstack" },
+        { source = "rpm/chirpstack.service", dest = "/lib/systemd/system/chirpstack-sqlite.service" },
+      ]
+
+      [package.metadata.generate-rpm.variants.sqlite.conflicts]
+        chirpstack = "*"

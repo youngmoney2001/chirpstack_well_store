@@ -1,0 +1,97 @@
+import { useState, useEffect } from "react";
+import { Route, Routes, useParams, Link } from "react-router";
+
+import { Space, Breadcrumb, Card, Menu } from "antd";
+
+import type { Application } from "@chirpstack/chirpstack-api-grpc-web/api/application_pb";
+import type { Tenant } from "@chirpstack/chirpstack-api-grpc-web/api/tenant_pb";
+import type { Device, GetDeviceResponse } from "@chirpstack/chirpstack-api-grpc-web/api/device_pb";
+import { GetDeviceRequest } from "@chirpstack/chirpstack-api-grpc-web/api/device_pb";
+
+import PageHeader from "../../components/PageHeader";
+import DeviceStore from "../../stores/DeviceStore";
+import ListRelayDevices from "./ListRelayDevices";
+import { useTitle } from "../helpers";
+
+interface IProps {
+  tenant: Tenant;
+  application: Application;
+}
+
+function RelayLayout(props: IProps) {
+  const [relayDevice, setRelayDevice] = useState<Device | undefined>(undefined);
+  const { relayDevEui } = useParams();
+  useTitle(
+    "Tenants",
+    props.tenant.getName(),
+    "Applications",
+    props.application.getName(),
+    "Relays",
+    relayDevice?.getName(),
+  );
+
+  useEffect(() => {
+    const req = new GetDeviceRequest();
+    req.setDevEui(relayDevEui!);
+
+    DeviceStore.get(req, (resp: GetDeviceResponse) => {
+      setRelayDevice(resp.getDevice());
+    });
+  }, [relayDevEui]);
+
+  const tenant = props.tenant;
+  const app = props.application;
+  const rd = relayDevice;
+
+  if (!rd) {
+    return null;
+  }
+
+  const tab = "devices";
+
+  return (
+    <Space orientation="vertical" style={{ width: "100%" }} size="large">
+      <PageHeader
+        breadcrumbRender={() => (
+          <Breadcrumb
+            items={[
+              { title: "Tenants" },
+              { title: <Link to={`/tenants/${tenant.getId()}`}>{tenant.getName()}</Link> },
+              { title: <Link to={`/tenants/${tenant.getId()}/applications`}>Applications</Link> },
+              { title: <Link to={`/tenants/${tenant.getId()}/applications/${app.getId()}`}>{app.getName()}</Link> },
+              { title: <Link to={`/tenants/${tenant.getId()}/applications/${app.getId()}/relays`}>Relays</Link> },
+              { title: rd.getName() },
+            ]}
+          />
+        )}
+        title={rd.getName()}
+        subTitle={`relay DevEUI: ${rd.getDevEui()}`}
+      />
+      <Card>
+        <Menu
+          mode="horizontal"
+          selectedKeys={[tab]}
+          style={{ marginBottom: 24 }}
+          items={[
+            {
+              key: "devices",
+              label: (
+                <Link to={`/tenants/${tenant.getId()}/applications/${app.getId()}/relays/${rd.getDevEui()}`}>
+                  Devices
+                </Link>
+              ),
+            },
+          ]}
+        />
+        <Routes>
+          <Route
+            path="/"
+            element={<ListRelayDevices relayDevice={rd} tenant={props.tenant} application={props.application} />}
+          />
+        </Routes>
+      </Card>
+    </Space>
+  );
+}
+
+export default RelayLayout;

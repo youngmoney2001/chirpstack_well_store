@@ -1,0 +1,141 @@
+.layout {
+  margin-left: 300px;
+}
+
+.layout-header {
+  background: #ffffff;
+  box-shadow: 0px 0px 10px 0px #ccc;
+  /* Leaflet JS zoom controls have z-index 1000. */
+  z-index: 1001;
+
+  position: fixed;
+  width: 100%;
+}
+
+.layout-header .logo {
+  float: left;
+  margin-top: 16px;
+  height: 32px;
+}
+
+.layout-header .actions {
+  float: right;
+}
+
+.layout-header .actions > div {
+  display: inline;
+  padding-left: 24px;
+}
+
+.layout-menu {
+  padding-top: 85px;
+
+  overflow: auto;
+  position: fixed !important;
+  height: 100vh;
+  left: 0;
+}
+
+.layout-menu .tenant-select {
+  margin-left: 24px;
+  margin-bottom: 12px;
+  width: 252px;
+}
+
+.layout-menu .version {
+  display: block;
+  margin-left: 24px;
+  margin-top: 12px;
+}
+
+.layout-content {
+  margin-top: 65px;
+}
+
+.layout-content .content-header > * {
+  float: right;
+}
+
+.layout-content .content-header h3 {
+  float: left;
+  display: inline;
+}
+
+.layout-content .content {
+  background: #ffffff;
+}
+
+.spinner {
+  text-align: center;
+}
+
+pre {
+  margin: 0px;
+}
+
+.chart-doughnut {
+  max-width: 350px;
+  padding: 0;
+  margin: auto;
+  display: block;
+}
+
+.chart-doughnut > canvas {
+  width: 100vh;
+}
+
+.dashboard-chart > .ant-card-body {
+  height: 300px;
+}
+
+.integration-card {
+  margin-bottom: 24px;
+}
+
+.integration-card .ant-card-meta-description {
+  min-height: 75px;
+}
+
+.search-dropdown .ant-select-dropdown-menu-item-group-title {
+  color: #666;
+  font-weight: bold;
+}
+
+.search-dropdown .ant-select-dropdown-menu-item-group {
+  border-bottom: 1px solid #f6f6f6;
+}
+
+.search-dropdown .ant-select-dropdown-menu-item {
+  padding-left: 16px;
+}
+
+.search-dropdown .ant-select-dropdown-menu-item.show-all {
+  text-align: center;
+  cursor: default;
+}
+
+.search-dropdown .ant-select-dropdown-menu {
+  max-height: 600px;
+}
+
+.CodeMirror {
+  height: 600px;
+}
+
+.ant-drawer {
+  padding-top: 64px;
+  z-index: 1002;
+}
+
+.ant-drawer-body {
+  padding-bottom: 88px;
+  /* 64 + 24 */
+}
+
+.input-code input {
+  font-family: monospace !important;
+}
+
+.css-var-root.ant-btn {
+  --ant-button-padding-inline-sm: 12px !important;
+}

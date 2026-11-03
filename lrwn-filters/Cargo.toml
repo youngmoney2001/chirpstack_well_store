@@ -1,0 +1,24 @@
+[package]
+  name = "lrwn_filters"
+  description = "Library for filtering LoRaWAN payloads on DevAddr and JoinEUIs prefixes"
+  homepage.workspace = true
+  license.workspace = true
+  version.workspace = true
+  authors.workspace = true
+  edition.workspace = true
+  repository.workspace = true
+
+  [package.metadata.docs.rs]
+    all-features = true
+
+[dependencies]
+  hex.workspace = true
+  thiserror.workspace = true
+  serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+  lrwn = { path = "../lrwn" }
+
+[features]
+  default = []
+  serde = ["dep:serde"]

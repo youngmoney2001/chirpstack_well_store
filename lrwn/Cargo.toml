@@ -1,0 +1,39 @@
+[package]
+  name = "lrwn"
+  description = "Library for encoding / decoding LoRaWAN frames."
+  homepage.workspace = true
+  license.workspace = true
+  version.workspace = true
+  authors.workspace = true
+  edition.workspace = true
+  repository.workspace = true
+
+  [package.metadata.docs.rs]
+    all-features = true
+
+[dependencies]
+  # Error handling
+  thiserror.workspace = true
+  anyhow.workspace = true
+
+  # Encoding
+  hex.workspace = true
+  serde = { workspace = true, optional = true }
+
+  # Crypto
+  cmac = { workspace = true, optional = true }
+  aes = { workspace = true, optional = true }
+
+  # Database
+  diesel = { workspace = true, optional = true }
+
+
+[features]
+  default = []
+  diesel = ["dep:diesel", "serde"]
+  postgres = ["diesel", "diesel/postgres_backend"]
+  sqlite = ["diesel", "diesel/sqlite"]
+  serde = ["dep:serde"]
+  crypto = ["dep:cmac", "dep:aes"]
+  regions = []
+  applayer = []

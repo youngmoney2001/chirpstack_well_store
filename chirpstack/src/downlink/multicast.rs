@@ -1,0 +1,530 @@
+use std::collections::{HashMap, HashSet};
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use petgraph::algo::min_spanning_tree;
+use petgraph::data::FromElements;
+use petgraph::graph::{DefaultIx, Graph, NodeIndex, UnGraph};
+use rand::RngExt;
+use tracing::{Instrument, Level, span, trace, warn};
+
+use crate::downlink::{error::Error, helpers};
+use crate::gateway::backend as gateway_backend;
+use crate::storage::{device, downlink_frame, gateway, multicast};
+use crate::{config, region};
+use chirpstack_api::{gw, internal};
+use lrwn::EUI64;
+
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+enum Node {
+    Gateway(EUI64),
+    Device(EUI64),
+}
+
+pub struct Multicast {
+    multicast_group_queue_item: multicast::MulticastGroupQueueItem,
+    downlink_frame: gw::DownlinkFrame,
+    region_config_id: String,
+    gateway: Option<gateway::Gateway>,
+    multicast_group: Option<multicast::MulticastGroup>,
+}
+
+impl Multicast {
+    pub async fn handle_schedule_queue_item(qi: multicast::MulticastGroupQueueItem) -> Result<()> {
+        let span = span!(Level::INFO, "multicast", multicast_group_id = %qi.multicast_group_id, gateway_id = %qi.gateway_id);
+
+        match Multicast::_handle_schedule_queue_item(qi)
+            .instrument(span)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => match e.downcast_ref::<Error>() {
+                Some(Error::Abort) => {
+                    // Nothing to do
+                    Ok(())
+                }
+                _ => Err(e),
+            },
+        }
+    }
+
+    async fn _handle_schedule_queue_item(qi: multicast::MulticastGroupQueueItem) -> Result<()> {
+        trace!("Handle schedule queue item flow");
+
+        let mut ctx = Multicast {
+            downlink_frame: gw::DownlinkFrame {
+                downlink_id: rand::rng().random(),
+                gateway_id: qi.gateway_id.to_string(),
+                ..Default::default()
+            },
+            multicast_group_queue_item: qi,
+            region_config_id: "".into(),
+            gateway: None,
+            multicast_group: None,
+        };
+
+        ctx.get_gateway().await?;
+        ctx.set_region_config_id()?;
+        ctx.get_multicast_group().await?;
+        ctx.validate_expiration().await?;
+        ctx.validate_payload_size().await?;
+        ctx.set_tx_info()?;
+        ctx.set_phy_payload()?;
+        ctx.save_downlink_frame().await?;
+        ctx.send_downlink_frame().await?;
+
+        Ok(())
+    }
+
+    async fn get_gateway(&mut self) -> Result<()> {
+        trace!("Get gateway");
+        let gw = gateway::get(&self.multicast_group_queue_item.gateway_id).await?;
+        self.gateway = Some(gw);
+        Ok(())
+    }
+
+    fn set_region_config_id(&mut self) -> Result<()> {
+        trace!("Setting region name");
+        let gw = self.gateway.as_ref().unwrap();
+        let region_config_id = &*(gw.properties)
+            .get("region_config_id")
+            .cloned()
+            .ok_or_else(|| anyhow!("Gateway does not have region_config_id property"))?;
+        self.region_config_id = region_config_id.to_string();
+
+        Ok(())
+    }
+
+    async fn get_multicast_group(&mut self) -> Result<()> {
+        trace!("Getting multicast-group");
+        let mg = multicast::get(&self.multicast_group_queue_item.multicast_group_id).await?;
+        self.multicast_group = Some(mg);
+        Ok(())
+    }
+
+    async fn validate_expiration(&self) -> Result<(), Error> {
+        trace!("Validating expires_at");
+        if let Some(expires_at) = self.multicast_group_queue_item.expires_at
+            && Utc::now() > expires_at
+        {
+            warn!(
+                expires_at = %expires_at,
+                "Discarding multicast-group queue item because it has expired"
+            );
+            multicast::delete_queue_item(&self.multicast_group_queue_item.id).await?;
+            return Err(Error::Abort);
+        }
+
+        Ok(())
+    }
+
+    async fn validate_payload_size(&self) -> Result<(), Error> {
+        trace!("Validating payload size for DR");
+        let mg = self.multicast_group.as_ref().unwrap();
+        let region_conf = region::get(&self.region_config_id)?;
+
+        let max_pl_size = region_conf.get_max_dl_payload_size(
+            lrwn::region::MacVersion::Latest,
+            lrwn::region::Revision::Latest,
+            mg.dr as u8,
+        )?;
+
+        if self.multicast_group_queue_item.data.len() > max_pl_size.n {
+            warn!(
+                dr = mg.dr,
+                max_pl_size = max_pl_size.n,
+                pl_size = self.multicast_group_queue_item.data.len(),
+                "Discarding multicast-group queue item because it exceeds max. payload size"
+            );
+            multicast::delete_queue_item(&self.multicast_group_queue_item.id).await?;
+            return Err(Error::Abort);
+        }
+
+        Ok(())
+    }
+
+    fn set_tx_info(&mut self) -> Result<()> {
+        trace!("Setting tx-info");
+
+        let network_conf = config::get_region_network(&self.region_config_id)?;
+        let region_conf = region::get(&self.region_config_id)?;
+        let mg = self.multicast_group.as_ref().unwrap();
+        let mc_dr = region_conf.get_data_rate(false, mg.dr as u8)?;
+
+        let mut tx_info = gw::DownlinkTxInfo {
+            frequency: mg.frequency as u32,
+            ..Default::default()
+        };
+
+        helpers::set_tx_info_data_rate(&mut tx_info, &mc_dr)?;
+
+        // set tx power
+        if network_conf.downlink_tx_power != -1 {
+            tx_info.power = network_conf.downlink_tx_power;
+        } else {
+            tx_info.power = region_conf.get_downlink_tx_power_eirp(tx_info.frequency) as i32;
+        }
+
+        match self.multicast_group_queue_item.emit_at_time_since_gps_epoch {
+            Some(v) => {
+                tx_info.timing = Some(gw::Timing {
+                    parameters: Some(gw::timing::Parameters::GpsEpoch(gw::GpsEpochTimingInfo {
+                        time_since_gps_epoch: Some(pbjson_types::Duration::from(
+                            std::time::Duration::from_millis(v as u64),
+                        )),
+                    })),
+                });
+            }
+            None => {
+                tx_info.timing = Some(gw::Timing {
+                    parameters: Some(gw::timing::Parameters::Immediately(
+                        gw::ImmediatelyTimingInfo {},
+                    )),
+                });
+            }
+        }
+
+        self.downlink_frame.items.push(gw::DownlinkFrameItem {
+            phy_payload: vec![],
+            tx_info: Some(tx_info),
+            tx_info_legacy: None,
+        });
+
+        Ok(())
+    }
+
+    fn set_phy_payload(&mut self) -> Result<()> {
+        trace!("Setting phy payload");
+        let mg = self.multicast_group.as_ref().unwrap();
+
+        let mut phy = lrwn::PhyPayload {
+            mhdr: lrwn::MHDR {
+                f_type: lrwn::FType::UnconfirmedDataDown,
+                major: lrwn::Major::LoRaWANR1,
+            },
+            payload: lrwn::Payload::MACPayload(lrwn::MACPayload {
+                fhdr: lrwn::FHDR {
+                    devaddr: mg.mc_addr,
+                    f_cnt: self.multicast_group_queue_item.f_cnt as u32,
+                    ..Default::default()
+                },
+                f_port: Some(self.multicast_group_queue_item.f_port as u8),
+                frm_payload: Some(lrwn::FRMPayload::Raw(
+                    self.multicast_group_queue_item.data.clone(),
+                )),
+            }),
+            mic: None,
+        };
+
+        phy.encrypt_frm_payload(&mg.mc_app_s_key)?;
+
+        // using LoRaWAN1_0 vs LoRaWAN1_1 only makes a difference when setting the
+        // confirmed frame-counter
+        phy.set_downlink_data_mic(lrwn::MACVersion::LoRaWAN1_1, 0, &mg.mc_nwk_s_key)?;
+
+        self.downlink_frame.items[0].phy_payload = phy.to_vec()?;
+
+        Ok(())
+    }
+
+    async fn save_downlink_frame(&self) -> Result<()> {
+        trace!("Saving downlink frame");
+
+        downlink_frame::save(&internal::DownlinkFrame {
+            downlink_id: self.downlink_frame.downlink_id,
+            multicast_group_id: self
+                .multicast_group_queue_item
+                .multicast_group_id
+                .as_bytes()
+                .to_vec(),
+            multicast_group_queue_item_id: self.multicast_group_queue_item.id.as_bytes().to_vec(),
+            downlink_frame: Some(self.downlink_frame.clone()),
+            ..Default::default()
+        })
+        .await
+        .context("Save downlink frame")?;
+
+        Ok(())
+    }
+
+    async fn send_downlink_frame(&self) -> Result<()> {
+        trace!("Sending downlink frame");
+
+        gateway_backend::send_downlink(&self.region_config_id, &self.downlink_frame)
+            .await
+            .context("Send downlink frame")?;
+
+        Ok(())
+    }
+}
+
+pub async fn enqueue(qi: multicast::MulticastGroupQueueItem) -> Result<u32> {
+    // Try first to get configured gateways for multicast-group.
+    let mut gateway_ids = multicast::get_gateway_ids(&qi.multicast_group_id).await?;
+
+    // Fallback to automatic gateway-set detection.
+    if gateway_ids.is_empty() {
+        // get deveuis for multicast-group
+        let dev_euis = multicast::get_dev_euis(&qi.multicast_group_id).await?;
+
+        // get gateway history
+        let dev_gw_history = device::get_gateway_history_for_dev_euis(&dev_euis).await?;
+
+        // get minimum gateway set to cover all devices
+        gateway_ids = get_minimum_gateway_set(&dev_gw_history)?;
+    }
+
+    // Enqueue multicast downlink for the given gw set.
+    let (_, f_cnt) = multicast::enqueue(qi, &gateway_ids).await?;
+    Ok(f_cnt)
+}
+
+fn get_minimum_gateway_set(
+    dev_gw_history: &HashMap<EUI64, Vec<internal::GatewayRxInfoHistory>>,
+) -> Result<Vec<EUI64>> {
+    if dev_gw_history.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut g: Graph<Node, f64, _> = Graph::new_undirected();
+    let mut node_index: HashMap<Node, NodeIndex<DefaultIx>> = HashMap::new();
+
+    // Get the unique set of gateways.
+    let gw_set = get_gateway_set(dev_gw_history)?;
+
+    // Add all gateways & connect them together
+    // W -999 is used so that the mst algorithm will remove the edge between
+    // the gateway and a device first, over removing an edge between two
+    // gateways.
+    for (i, gw_id) in gw_set.iter().enumerate() {
+        let idx = g.add_node(Node::Gateway(*gw_id));
+        node_index.insert(Node::Gateway(*gw_id), idx);
+
+        if i != 0 {
+            g.add_edge(
+                *node_index.get(&Node::Gateway(gw_set[0])).unwrap(),
+                *node_index.get(&Node::Gateway(*gw_id)).unwrap(),
+                -999.0,
+            );
+        }
+    }
+
+    // Get the device count per gateway ID.
+    let gateway_device_count = get_gateway_device_count_map(dev_gw_history)?;
+
+    // Add all devices and add edges to gateways
+    for (dev_eui, history_vec) in dev_gw_history {
+        let dev_eui = *dev_eui;
+        let mut gw_set: HashSet<EUI64> = HashSet::new();
+
+        let idx = g.add_node(Node::Device(dev_eui));
+        node_index.insert(Node::Device(dev_eui), idx);
+
+        for history in history_vec {
+            for i in &history.items {
+                let gateway_id = EUI64::from_slice(&i.gateway_id)?;
+                if gw_set.insert(gateway_id) {
+                    g.add_edge(
+                        *node_index.get(&Node::Gateway(gateway_id)).unwrap(),
+                        *node_index.get(&Node::Device(dev_eui)).unwrap(),
+                        1.0 / gateway_device_count
+                            .get(&gateway_id)
+                            .cloned()
+                            .unwrap_or_default() as f64,
+                    );
+                }
+            }
+        }
+    }
+
+    // Get the min spanning tree to determine the minimum set of gateways that is needed to cover
+    // all devices.
+    let mst = UnGraph::<_, _>::from_elements(min_spanning_tree(&g));
+
+    Ok(mst
+        .node_indices()
+        .filter(|i| match mst[*i] {
+            // We want to get all gateway nodes that have an edge to a device. So if the node is of
+            // type gateway, we request all neighbors and filter on Node::Device. In case this does
+            // not return any elements, we know it has no edge to a device.
+            Node::Gateway(_) => mst
+                .neighbors(*i)
+                .filter(|ii| match mst[*ii] {
+                    Node::Device(_) => true,
+                    Node::Gateway(_) => false,
+                })
+                .peekable()
+                .peek()
+                .is_some(),
+            Node::Device(_) => false,
+        })
+        .map(|i| match mst[i] {
+            Node::Gateway(v) => v,
+            Node::Device(v) => v, // Should not happen as we have already filtered on gateways.
+        })
+        .collect())
+}
+
+fn get_gateway_set(
+    dev_gw_history: &HashMap<EUI64, Vec<internal::GatewayRxInfoHistory>>,
+) -> Result<Vec<EUI64>> {
+    let mut out: HashSet<EUI64> = HashSet::new();
+    for history_vec in dev_gw_history.values() {
+        for history in history_vec {
+            for i in &history.items {
+                let gateway_id = EUI64::from_slice(&i.gateway_id)?;
+                out.insert(gateway_id);
+            }
+        }
+    }
+
+    Ok(out.iter().cloned().collect())
+}
+
+fn get_gateway_device_count_map(
+    dev_gw_history: &HashMap<EUI64, Vec<internal::GatewayRxInfoHistory>>,
+) -> Result<HashMap<EUI64, usize>> {
+    let mut out: HashMap<EUI64, usize> = HashMap::new();
+    for history_vec in dev_gw_history.values() {
+        for history in history_vec {
+            for i in &history.items {
+                let gateway_id = EUI64::from_slice(&i.gateway_id)?;
+                *out.entry(gateway_id).or_insert(0) += 1;
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+pub mod test {
+    use super::*;
+
+    #[test]
+    fn test_minimum_gateway_set() {
+        struct Test {
+            name: String,
+            dev_gw_history: HashMap<EUI64, Vec<internal::GatewayRxInfoHistory>>,
+            expected_gws: Vec<EUI64>,
+        }
+
+        let tests = vec![
+            Test {
+                name: "one device - one gateway".into(),
+                dev_gw_history: [(
+                    EUI64::from_be_bytes([1, 1, 1, 1, 1, 1, 1, 1]),
+                    vec![internal::GatewayRxInfoHistory {
+                        items: vec![internal::GatewayRxInfoHistoryItem {
+                            gateway_id: vec![2, 2, 2, 2, 2, 2, 2, 2],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                )]
+                .into_iter()
+                .collect(),
+                expected_gws: vec![EUI64::from_be_bytes([2, 2, 2, 2, 2, 2, 2, 2])],
+            },
+            Test {
+                name: "one device - two gateways".into(),
+                dev_gw_history: [(
+                    EUI64::from_be_bytes([1, 1, 1, 1, 1, 1, 1, 1]),
+                    vec![internal::GatewayRxInfoHistory {
+                        items: vec![
+                            internal::GatewayRxInfoHistoryItem {
+                                gateway_id: vec![2, 2, 2, 2, 2, 2, 2, 1],
+                                ..Default::default()
+                            },
+                            internal::GatewayRxInfoHistoryItem {
+                                gateway_id: vec![2, 2, 2, 2, 2, 2, 2, 2],
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    }],
+                )]
+                .into_iter()
+                .collect(),
+                expected_gws: vec![EUI64::from_be_bytes([2, 2, 2, 2, 2, 2, 2, 1])],
+            },
+            Test {
+                name: "two devices - two gateways (no overlap)".into(),
+                dev_gw_history: vec![
+                    (
+                        EUI64::from_be_bytes([1, 1, 1, 1, 1, 1, 1, 1]),
+                        vec![internal::GatewayRxInfoHistory {
+                            items: vec![internal::GatewayRxInfoHistoryItem {
+                                gateway_id: vec![2, 2, 2, 2, 2, 2, 2, 1],
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                    ),
+                    (
+                        EUI64::from_be_bytes([1, 1, 1, 1, 1, 1, 1, 2]),
+                        vec![internal::GatewayRxInfoHistory {
+                            items: vec![internal::GatewayRxInfoHistoryItem {
+                                gateway_id: vec![2, 2, 2, 2, 2, 2, 2, 2],
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                expected_gws: vec![
+                    EUI64::from_be_bytes([2, 2, 2, 2, 2, 2, 2, 1]),
+                    EUI64::from_be_bytes([2, 2, 2, 2, 2, 2, 2, 2]),
+                ],
+            },
+            Test {
+                name: "two devices - two gateways (overlap, second gw covers two devices)".into(),
+                dev_gw_history: vec![
+                    (
+                        EUI64::from_be_bytes([1, 1, 1, 1, 1, 1, 1, 1]),
+                        vec![internal::GatewayRxInfoHistory {
+                            items: vec![internal::GatewayRxInfoHistoryItem {
+                                gateway_id: vec![2, 2, 2, 2, 2, 2, 2, 2],
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                    ),
+                    (
+                        EUI64::from_be_bytes([1, 1, 1, 1, 1, 1, 1, 2]),
+                        vec![internal::GatewayRxInfoHistory {
+                            items: vec![
+                                internal::GatewayRxInfoHistoryItem {
+                                    gateway_id: vec![2, 2, 2, 2, 2, 2, 2, 1],
+                                    ..Default::default()
+                                },
+                                internal::GatewayRxInfoHistoryItem {
+                                    gateway_id: vec![2, 2, 2, 2, 2, 2, 2, 2],
+                                    ..Default::default()
+                                },
+                            ],
+                            ..Default::default()
+                        }],
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                expected_gws: vec![EUI64::from_be_bytes([2, 2, 2, 2, 2, 2, 2, 2])],
+            },
+        ];
+
+        for tst in &tests {
+            println!("> {}", tst.name);
+            let gws: HashSet<EUI64> = get_minimum_gateway_set(&tst.dev_gw_history)
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect();
+            let expected: HashSet<EUI64> = tst.expected_gws.iter().cloned().collect();
+
+            assert_eq!(expected, gws);
+        }
+    }
+}

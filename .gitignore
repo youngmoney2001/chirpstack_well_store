@@ -1,0 +1,31 @@
+# Log files
+*.log
+
+# Binary packages / build output
+/dist
+**/target
+**/target-sqlite
+
+# SQLite databases
+*.sqlite
+*.sqlite-*
+
+# Certificates and local (private) configuration
+/chirpstack/configuration/certs/*
+/chirpstack/configuration/private_*.toml
+
+# UI build output and dependencies
+/ui/node_modules
+/ui/build
+/ui/dist
+node_modules/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Note: upstream's .gitignore started with `.*`, which ignores every dotfile.
+# This fork must track .cargo/config.toml, .env, .docker-compose/ and
+# .github/ (development configuration), so that rule was intentionally dropped.

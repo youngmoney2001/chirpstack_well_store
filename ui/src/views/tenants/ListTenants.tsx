@@ -1,0 +1,129 @@
+import { Link } from "react-router";
+
+import { Space, Breadcrumb, Button } from "antd";
+import type { ColumnsType } from "antd/es/table";
+
+import type { ListTenantsResponse, TenantListItem } from "@chirpstack/chirpstack-api-grpc-web/api/tenant_pb";
+import { ListTenantsRequest } from "@chirpstack/chirpstack-api-grpc-web/api/tenant_pb";
+
+import type { GetPageCallbackFunc } from "../../components/DataTable";
+import DataTable from "../../components/DataTable";
+import TenantStore from "../../stores/TenantStore";
+import { useTitle } from "../helpers";
+import PageHeader from "../../components/PageHeader";
+
+function ListTenants() {
+  useTitle("Network Server", "Tenants");
+  const columns: ColumnsType<TenantListItem.AsObject> = [
+    {
+      title: "Name",
+      dataIndex: "name",
+      key: "name",
+      render: (text, record) => <Link to={`/tenants/${record.id}`}>{text}</Link>,
+    },
+    {
+      title: "Can have gateways",
+      dataIndex: "canHaveGateways",
+      key: "canHaveGateways",
+      width: 250,
+      render: (text, record) => {
+        if (record.canHaveGateways) {
+          return "yes";
+        } else {
+          return "no";
+        }
+      },
+    },
+    {
+      title: "Private gateways (uplink)",
+      dataIndex: "privateGatewaysUp",
+      key: "privateGatewaysUp",
+      width: 250,
+      render: (text, record) => {
+        if (record.privateGatewaysUp) {
+          return "yes";
+        } else {
+          return "no";
+        }
+      },
+    },
+    {
+      title: "Private gateways (down)",
+      dataIndex: "privateGatewaysDown",
+      key: "privateGatewaysDown",
+      width: 250,
+      render: (text, record) => {
+        if (record.privateGatewaysDown) {
+          return "yes";
+        } else {
+          return "no";
+        }
+      },
+    },
+    {
+      title: "Max. gateways",
+      dataIndex: "maxGatewayCount",
+      key: "maxGatewayCount",
+      width: 250,
+      render: (text, record) => {
+        if (!record.canHaveGateways) {
+          return 0;
+        }
+
+        if (record.maxGatewayCount === 0) {
+          return "unlimited";
+        } else {
+          return record.maxGatewayCount;
+        }
+      },
+    },
+    {
+      title: "Max. devices",
+      dataIndex: "maxDeviceCount",
+      key: "maxDeviceCount",
+      width: 250,
+      render: (text, record) => {
+        if (record.maxDeviceCount === 0) {
+          return "unlimited";
+        } else {
+          return record.maxDeviceCount;
+        }
+      },
+    },
+  ];
+
+  const getPage = (
+    limit: number,
+    offset: number,
+    _filters: object,
+    orderBy: string | void,
+    orderByDesc: boolean | void,
+    callbackFunc: GetPageCallbackFunc,
+  ) => {
+    const req = new ListTenantsRequest();
+    req.setLimit(limit);
+    req.setOffset(offset);
+
+    TenantStore.list(req, (resp: ListTenantsResponse) => {
+      const obj = resp.toObject();
+      callbackFunc(obj.totalCount, obj.resultList);
+    });
+  };
+
+  return (
+    <Space orientation="vertical" style={{ width: "100%" }} size="large">
+      <PageHeader
+        breadcrumbRender={() => <Breadcrumb items={[{ title: "Network Server" }, { title: "Tenants" }]} />}
+        title="Tenants"
+        extra={[
+          <Button type="primary" key="add-tenants">
+            <Link to="/tenants/create">Add tenant</Link>
+          </Button>,
+        ]}
+      />
+      <DataTable columns={columns} getPage={getPage} rowKey="id" />
+    </Space>
+  );
+}
+
+export default ListTenants;

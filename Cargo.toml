@@ -1,0 +1,178 @@
+[workspace]
+  resolver = "2"
+  members = [
+    "chirpstack",
+    "chirpstack-integration",
+    "lrwn",
+    "lrwn-filters",
+    "backend",
+    "api/rust",
+  ]
+
+  [workspace.package]
+    version = "4.20.0"
+    homepage = "https://www.chirpstack.io"
+    license = "MIT"
+    authors = ["Orne Brocaar <info@brocaar.com>"]
+    edition = "2024"
+    repository = "https://github.com/chirpstack/chirpstack"
+
+  [workspace.dependencies]
+    # Encoding
+    hex = "0.4"
+    base64 = "0.23"
+    serde = { version = "1.0", features = ["derive"] }
+    serde_json = "1.0"
+    serde_yaml = "0.9"
+    urlencoding = "2.1"
+    serde_urlencoded = "0.7"
+    humantime-serde = "1.1"
+    toml = { version = "1.1", default-features = false, features = [
+      "std",
+      "parse",
+      "serde",
+    ] }
+    geohash = "0.13"
+    url = "2.5"
+
+    # Crypto
+    cmac = "0.8"
+    aes = "0.9"
+    rand = "0.10"
+    getrandom = "0.4"
+    aes-kw = "0.3"
+    hmac = "0.13"
+    sha2 = "0.11"
+    pbkdf2 = { version = "0.13", features = ["phc", "getrandom"] }
+    jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
+    rustls = { version = "0.23", default-features = false, features = [
+      "logging",
+      "std",
+      "tls12",
+      "ring",
+    ] }
+    rustls-native-certs = "0.8"
+    rustls-pemfile = "2.2"
+    pem = "4.0"
+    x509-parser = "0.18"
+    rsa = "0.9"
+    p256 = { version = "0.14" }
+    rcgen = { version = "0.14", features = ["x509-parser"] }
+    oauth2 = "5.0.0"
+    openidconnect = { version = "4.0", features = [
+      "accept-rfc3339-timestamps",
+    ] }
+
+    # Database
+    diesel = "2.3"
+    diesel_migrations = { version = "2.3" }
+    diesel-async = { version = "0.9", features = [
+      "deadpool",
+      "async-connection-wrapper",
+    ] }
+    tokio-postgres = { version = "0.7" }
+    tokio-postgres-rustls = { version = "0.14" }
+    bigdecimal = "0.4"
+    redis = { version = "1.7", features = ["tls-rustls", "tokio-rustls-comp"] }
+    deadpool-redis = { version = "0.23", features = ["cluster", "serde"] }
+
+    # Error
+    thiserror = "2.0"
+    anyhow = "1.0"
+
+    # Logging
+    tracing = "0.1"
+    tracing-subscriber = { version = "0.3", features = ["fmt", "ansi", "json"] }
+    prometheus-client = "0.25"
+
+    # HTTP
+    reqwest = { version = "0.12", features = [
+      "json",
+      "rustls-tls-native-roots",
+    ], default-features = false }
+    axum = "0.8"
+    axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+    tower = { version = "0.5", features = ["util"] }
+    tower-http = { version = "0.7", features = ["trace", "auth"] }
+    http = "1.5"
+    http-body = "1.0"
+
+    # Date & time
+    chrono = { version = "0.4", features = ["serde"] }
+
+    # Async
+    tokio = { version = "1.53", features = ["macros"] }
+    tokio-executor-trait = "3.1"
+    tokio-reactor-trait = "4.1"
+    tokio-stream = "0.1"
+    futures = "0.3"
+    futures-util = "0.3"
+    async-trait = "0.1"
+    async-recursion = "1.2"
+
+    # Testing
+    httpmock = "0.8"
+
+    # API
+    prost = "0.14"
+    prost-types = "0.14"
+    tonic = { version = "0.14", default-features = false }
+    tonic-build = { version = "0.14", default-features = false }
+    tonic-prost-build = { version = "0.14", default-features = false }
+    tonic-prost = "0.14"
+    pbjson = "0.9"
+    pbjson-build = "0.9"
+    pbjson-types = "0.9"
+    tonic-web = "0.14"
+    tonic-reflection = "0.14"
+
+    # CLI
+    clap = { version = "4.6", features = ["derive"] }
+
+    # Templating
+    handlebars = "6.4"
+
+    # Utilities
+    validator = { version = "0.21", features = ["derive"] }
+    aws-sign-v4 = "0.3"
+    gcp_auth = "0.12"
+    rust-embed = "8.11"
+    mime_guess = "2.0"
+    rquickjs = { version = "0.14", features = [
+      "bindgen",
+      "loader",
+      "array-buffer",
+      "chrono",
+    ] }
+    uuid = { version = "1.27", features = ["v4", "serde"] }
+    regex = "1.13"
+    petgraph = "0.8"
+    pin-project = "1.1"
+    signal-hook = "0.4"
+    signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
+    bytes = "1.12"
+    rpassword = "7.5"
+    dotenv = "0.15"
+
+    # Integrations
+    lapin = { version = "4.12", default-features = false, features = [
+      "tokio",
+      "rustls--ring",
+      "rustls-native-certs",
+    ] }
+    rdkafka = { version = "0.38", default-features = false, features = [
+      "tokio",
+      "cmake-build",
+    ] }
+    # Needed until this issue has been solved: https://github.com/fede1024/rust-rdkafka/issues/829
+    rdkafka-sys = { version = "~4.9.0", default-features = false }
+    rumqttc = { version = "0.25", default-features = false, features = [
+      "url",
+      "use-rustls-no-provider",
+    ] }
+
+
+[profile.release]
+  opt-level = 'z'
+  lto = true
+  codegen-units = 1

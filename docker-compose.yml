@@ -1,0 +1,57 @@
+services:
+  chirpstack:
+    build:
+      context: .
+      dockerfile: Dockerfile-devel
+    volumes:
+      - ./:/chirpstack
+    depends_on:
+      - postgres
+      - redis
+      - mosquitto
+      - rabbitmq
+      - kafka
+    environment:
+      - DATABASE_URL=postgres://chirpstack_test:chirpstack_test@postgres/chirpstack_test?sslmode=disable
+      - REDIS_HOST=redis
+      - POSTGRESQL_HOST=postgres
+      - MQTT_BROKER_HOST=mosquitto
+      - TEST_POSTGRESQL_DSN=postgres://chirpstack_test:chirpstack_test@postgres/chirpstack_test?sslmode=disable
+      - TEST_REDIS_URL=redis://redis/1
+      - TEST_MOSQUITTO_SERVER=tcp://mosquitto:1883/
+      - TEST_KAFKA_BROKER=kafka:9092
+      - TEST_AMQP_URL=amqp://guest:guest@rabbitmq:5672
+    ports:
+      - "8080:8080"
+
+  postgres:
+    image: postgres:18-alpine
+    volumes:
+      - ./.docker-compose/postgresql/initdb:/docker-entrypoint-initdb.d
+    environment:
+      - POSTGRES_HOST_AUTH_METHOD=trust
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "6379:6379"
+
+  mosquitto:
+    volumes:
+      - ./.docker-compose/mosquitto/config/:/mosquitto/config/
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    ports:
+      - "15672:15672"
+      - "5672:5672"
+
+  kafka:
+    image: 'apache/kafka:4.1.0'
+    ports:
+      - "9092:9092"
