@@ -195,6 +195,11 @@ Trois changements, tous dans `chirpstack/src/codec/js/mod.rs` :
 
 ### Configuration
 
+> **État actuel** : ce tableau décrit l'état du commit `54efb7b`. Le
+> durcissement décrit plus loin (« Durcissement sécurité de la 2.1 ») étend la
+> configuration et remplace plusieurs de ces choix ; s'y référer pour la
+> configuration en vigueur.
+
 Deux options ajoutées à `[codec.js]` (`config.rs` + template `configfile.rs`),
 avec `#[serde(default)]` donc sans impact sur les fichiers de config existants :
 
@@ -236,12 +241,13 @@ cargo test --offline -p chirpstack codec::js::bench -- --ignored --nocapture
 
 ### Risques et limites
 
-- **Différence sémantique assumée** : avec `cache_scripts=true`, l'état de haut
-  niveau d'un codec (`var counter = 0;` en dehors de la fonction) persiste
-  entre appels sur un même worker, alors que l'amont repartait de zéro. Les
-  codecs doivent être des fonctions pures (recommandation ChirpStack). Le
-  comportement amont est restaurable par `cache_scripts=false`. Un test dédie
-  documente explicitement les deux modes (`pool_test`).
+- **Différence sémantique** : avec `cache_scripts=true`, l'état de haut niveau
+  d'un codec (`var counter = 0;` en dehors de la fonction) persiste entre
+  appels, alors que l'amont repartait de zéro. Le comportement amont est
+  restaurable par `cache_scripts=false`. **Le risque inter-tenants a été
+  supprimé par le durcissement ci-dessous** (un `Context` et une clé de cache
+  par tenant + profil) ; l'état ne persiste plus que pour un même triplet
+  `(tenant, profil, script)`.
 - **Empreinte mémoire** : jusqu'à `available_parallelism()` runtimes ×
   `max_cached_scripts` scripts compilés. Ajuster `max_cached_scripts` si le
   nombre de profils de devices est très inférieur à la valeur par défaut.
@@ -253,6 +259,237 @@ cargo test --offline -p chirpstack codec::js::bench -- --ignored --nocapture
 - Un cache par worker signifie qu'un même script peut être compilé sur
   plusieurs threads : c'est voulu (pas de verrou global), mais à prendre en
   compte pour les codecs à état.
+
+---
+
+## Durcissement sécurité de la 2.1 — appliqué (2026-11-03)
+
+Objectif : **corriger des failles**, pas seulement gagner en performance. Le
+commit `54efb7b` (pool + cache de scripts) laissait trois problèmes
+d'isolation / de ressources.
+
+| # | Faille dans `54efb7b` | Correction |
+| --- | --- | --- |
+| 1 | Un seul `Context` par worker partagé par tous les scripts en cache : un codec modifiant `Object.prototype`, `JSON.parse`, `Buffer` ou `Array.prototype` contaminait les autres profils/tenants. | Un `Context::full()` **par entrée de cache** (même Runtime) ; l'entrée contient `(Context, Persistent<Function>)`. |
+| 2 | Clé = hash du script seul : deux tenants avec le même texte partageaient la fonction compilée et son état global. | Clé = `(tenant_id, device_profile_id, hash(script))`, identité remontée depuis les appelants ; vérification du texte complet conservée. |
+| 3 | Aucune limite mémoire/stack, ni GC, ni recyclage ; un OOM pouvait panic. | `set_memory_limit` / `set_max_stack_size`, GC périodique, recyclage après N appels ou seuil mémoire, `catch_unwind` + erreur propre + worker jeté. |
+| 4 | `cache_scripts=true` par défaut avant validation. | Défaut repassé à `false` pendant les travaux, puis remis à `true` **uniquement après** les validations du §4. |
+
+### 1. Isolation des contextes
+
+`CachedScript { script, entry: Option<Persistent<Function>>, ctx: Context }`.
+`Drop for CachedScript` libère le `Persistent` **avant** son `Context` ;
+`Drop for Worker` vide le cache (donc tous les `Context`) **avant** le
+`Runtime`. rquickjs `abort()` le processus si une valeur persistante survit à
+son runtime : cet ordre est une propriété de sûreté, pas du nettoyage cosmétique.
+
+Les modules vendored sont chargés **dans chaque Context** : le wrapper importe
+`buffer` (qui importe `ieee754` et `base64-js`) et QuickJS tient son registre de
+modules par `JSContext`, donc le loader est sollicité à nouveau pour chaque
+nouveau realm.
+
+> **Piège rquickjs 0.14 découvert en test** : `BuiltinLoader::load()` fait
+> `self.modules.remove(path)` — c'est un loader **à usage unique**. Le loader
+> étant installé sur le Runtime, le premier Context consomme la source
+> `buffer` et le second échoue avec `Error loading module 'buffer'` (5 tests en
+> échec lors de la première passe). Correction propre via le trait public
+> `rquickjs::loader::Loader` : `VendorLoader` conserve ses sources et
+> re-déclare le module dans le `Ctx` appelant (`get` + `clone` au lieu de
+> `remove`). Aucun `unsafe`, aucun patch de dépendance, aucun renommage de
+> modules.
+
+`Context::as_raw()` permet au test `each_cache_entry_has_its_own_context` de
+vérifier structurellement que deux entrées ont deux realms distincts.
+
+### 2. Clé de cache et propagation des identifiants
+
+`CodecIdentity { tenant_id: Option<Uuid>, device_profile_id: Option<Uuid> }`
+est défini dans `codec/mod.rs`. Les trois appelants réels construisent
+l'identité depuis le `DeviceProfile` (`dp.tenant_id`, `dp.id`) et la passent à
+`binary_to_struct` / `struct_to_binary`, puis à `js::decode` / `js::encode` :
+
+- `chirpstack/src/uplink/data.rs` (décodage d'uplink) ;
+- `chirpstack/src/api/device.rs` (mise en file de downlink via gRPC) ;
+- `chirpstack/src/integration/mod.rs` (downlink via intégration MQTT).
+
+`CacheKey { tenant_id, device_profile_id, script_hash }`, plus la comparaison
+du texte complet stocké dans l'entrée : une collision de hash ne peut pas
+retourner le code compilé d'un autre script. Les 8 tests amont gardent leur
+corps intact grâce à deux shims locaux utilisant `CodecIdentity::default()`.
+
+### 3. Limites de ressources
+
+Toutes les options ont `#[serde(default)]` sur `CodecJs` : les fichiers de
+configuration existants restent valides.
+
+| Option | Défaut | Rôle |
+| --- | --- | --- |
+| `cache_scripts` | `true` | `false` = comportement amont (Runtime + Context neufs par appel). |
+| `max_cached_scripts` | `64` | Scripts compilés / realms conservés par worker (minimum 1). |
+| `max_memory_bytes` | `33 554 432` (32 Mio) | Limite dure QuickJS par **Runtime** ; `0` = illimité (déconseillé). |
+| `max_stack_bytes` | `524 288` (512 Kio) | Taille max de la pile JS. |
+| `max_calls_per_worker` | `10 000` | Recyclage après N appels. |
+| `gc_every_calls` | `100` | `1` = GC à chaque appel, `0` = désactivé. |
+
+Le seuil de recyclage mémoire est dérivé : 75 % de `max_memory_bytes`
+(`recycle_memory_bytes()`), via `Runtime::memory_usage().memory_used_size`.
+Pas de knob supplémentaire ; `max_memory_bytes=0` le désactive.
+
+**Mesure de l'impact du GC** — `JS_RunGC` parcourt *tous* les contextes du
+runtime, il faut donc mesurer avec un cache plein (binaire debug,
+`--test-threads=1`, benchmarks ignorés exécutés isolément) :
+
+| Scénario | `gc=1` | `gc=100` | `gc=0` |
+| --- | --- | --- | --- |
+| 1 realm | 0,34 – 0,38 ms/appel | 0,20 – 0,25 ms/appel | 0,19 – 0,35 ms/appel |
+| **64 realms (cache plein)** | **8,1 – 8,4 ms/appel** | 0,10 – 0,12 ms/appel | 0,018 ms/appel |
+
+⇒ `gc_every_calls=100` : un GC à chaque appel est environ **75× plus lent**
+avec un cache plein et casserait l'objectif « bien sous 1 ms ». `1` et `0`
+restent configurables.
+
+**Recyclage** : le worker entier est jeté et reconstruit à l'appel suivant
+après `max_calls_per_worker` appels, si la mémoire atteint 75 % de la limite,
+ou **après toute erreur** (exception JS, timeout, OOM, stack overflow, panic
+Rust intercepté). Cela borne l'accumulation d'atomes, de shapes, de garbage
+cyclique et d'intrinsèques modifiées, et garantit qu'un runtime empoisonné
+n'est jamais réutilisé pour un autre device.
+
+**Erreur propre** : `run_guarded()` enveloppe `Worker::run` dans
+`catch_unwind(AssertUnwindSafe(...))`. Un échec d'allocation profond dans
+rquickjs ou dans `codec::convert` devient
+`JS codec engine aborted (worker discarded): ...` au lieu d'un panic remontant
+jusqu'à Tokio. Les OOM levés par QuickJS deviennent
+`JS codec memory limit exceeded: Error: out of memory`, les débordements de
+pile `JS error: Error: Maximum call stack size exceeded`. Les deux tests
+vérifient que l'appel suivant fonctionne.
+
+### 4. Valeur par défaut : justification du passage à `true`
+
+`cache_scripts` est resté à **`false` pendant toute la phase de durcissement**
+afin qu'aucune modification non validée ne soit active par défaut. Il n'a été
+repassé à `true` qu'après les validations suivantes :
+
+1. 8 tests amont + 16 tests `pool_test` (dont les 8 nouveaux tests de
+   sécurité) → ✅ **24/24** ;
+2. `rustfmt`, `cargo clippy`, `cargo check` postgres **et** sqlite → ✅ 0
+   erreur, aucun warning dans les fichiers modifiés ;
+3. `chirpstack --config <DIR> configfile` → ✅ TOML valide, 6 options rendues ;
+4. bench → ✅ **0,20 – 0,27 ms/appel** avec le défaut (bien sous 1 ms) ;
+5. bench cache miss → ✅ ~8,5 – 11,6 ms, **une seule fois** par nouveau triplet ;
+6. `a_full_cache_stays_within_the_memory_limit` → ✅ 64 realms =
+   **13 994 717 octets**, sous la limite de 32 Mio et sous le seuil de
+   recyclage de 24 Mio.
+
+Pour un déploiement multi-tenant exigeant une équivalence stricte avec
+l'amont, `cache_scripts=false` reste le choix prudent (Runtime + Context neufs
+par appel), au prix de ~8,4 ms par décodage mesuré ici.
+
+### 5. Tests ajoutés (en plus des 16 existants)
+
+| Test | Propriété vérifiée |
+| --- | --- |
+| `prototype_and_json_pollution_is_confined_to_one_profile` | Un codec A qui pose `Object.prototype.x` et remplace `JSON.parse` n'affecte ni le profil B (même texte de script) ni un autre tenant. |
+| `same_script_is_not_shared_between_tenants_or_profiles` | Texte identique sous 2 tenants/profils : compteur global non partagé (séquence 1,2,1,3,2,4). |
+| `each_cache_entry_has_its_own_context` | Deux entrées ont deux `Context::as_raw()` distincts dans le même Runtime. |
+| `resource_limits_are_applied_to_the_runtime` | `memory_usage().malloc_limit == max_memory_bytes`. |
+| `memory_limit_returns_error_and_discards_worker` | Allocation en boucle ⇒ erreur OOM propre, worker jeté, appel suivant OK. |
+| `stack_overflow_returns_error_without_crashing` | Récursion infinie ⇒ `Maximum call stack size exceeded`, pas de crash, appel suivant OK. |
+| `worker_is_recycled_after_max_calls_per_worker` | Avec `max_calls_per_worker=3`, résultats identiques et état remis à zéro (1,2,3,1,2,3,…). |
+| `a_full_cache_stays_within_the_memory_limit` | 64 realms tiennent dans les 32 Mio et sous le seuil de recyclage. |
+| `bench_gc_with_a_full_cache` (ignoré) | Mesure le coût réel de `JS_RunGC` avec 64 realms. |
+
+### 6. Validation et chiffres du bench
+
+| Mesure (200 appels, isolé, 3 runs) | Résultat |
+| --- | --- |
+| Pool durci, `gc=100` (défaut) | 39,4 / 50,0 / 45,8 / 54,9 ms → **0,197 / 0,250 / 0,229 / 0,274 ms par appel** |
+| Pool durci, `gc=1` | 76,0 / 71,2 / 67,5 / 92,0 ms → 0,380 / 0,356 / 0,338 / 0,460 ms par appel |
+| Pool durci, `gc=0` | 70,2 / 43,7 / 38,9 / 40,6 ms → 0,351 / 0,219 / 0,194 / 0,203 ms par appel |
+| `cache_scripts=false` (amont) | 1,67 / 1,69 / 1,73 / 1,79 s → **8,36 / 8,45 / 8,63 / 8,95 ms par appel** |
+| Cache miss (nouveau Context + modules vendored) | 346,9 / 339,6 / 464,1 ms pour 40 → **8,67 / 8,49 / 11,60 ms, une fois par clé** |
+| Gain sur appels en cache | ≈ **×33 – ×42** vs le chemin « runtime neuf » du même binaire |
+
+Reproduire :
+
+```bash
+cargo test --offline -p chirpstack codec::js:: -- --test-threads=1
+cargo test --offline -p chirpstack codec::js::bench -- --ignored --nocapture --test-threads=1
+cargo test --offline -p chirpstack codec::js::pool_test::bench_gc_with_a_full_cache \
+  -- --ignored --nocapture --test-threads=1
+```
+
+> Note sandbox : le linker du binaire de test est tué par l'OOM (SIGKILL) avec
+> la compilation incrémentale. `CARGO_INCREMENTAL=0 cargo test ... --no-run`
+> contourne ce problème d'environnement (doc `OFFLINE-BUILD.md`).
+
+### 7. Ce que rquickjs 0.14 ne permet pas — et alternatives
+
+**a) Les limites sont par `JSRuntime`, pas par `JSContext`.**
+`set_memory_limit`, `set_max_stack_size`, `run_gc` et `memory_usage` sont des
+API C prenant un `JSRuntime*`. Avec un Runtime par worker et N Contexts, un
+tenant peut consommer le budget partagé et provoquer une erreur OOM pour les
+autres realms du même worker ; le GC est global. Ce n'est donc **pas** une
+isolation mémoire forte par tenant.
+
+- *Alternative recommandée si l'isolation forte est exigée* : **un Runtime par
+  entrée de cache** (ou par tenant) avec une LRU bornée. Chaque limite devient
+  alors réellement par realm et `Persistent::restore` devient sûr par
+  construction. Coût : un `Runtime::new()` par script mis en cache (~8,5 ms
+  mesurés à la création d'un realm) et une empreinte mémoire supérieure.
+  Variante moins coûteuse : partitionner le pool par tenant (un semaphore et
+  un ou plusieurs workers dédiés par tenant) — cela limite le bruit mais pas le
+  budget mémoire partagé.
+- *Mitigation en place* : recyclage de tout le worker à 75 % de la limite et
+  discard immédiat sur OOM. Le rayon d'action d'un codec glouton est limité à
+  un worker et à la trame courante ; les autres requêtes sont servies par les
+  autres workers du sémaphore.
+
+**b) `Persistent::restore` ne vérifie que le pointeur de Runtime**, pas le
+`JSContext` d'origine (`rquickjs-core/src/persistent.rs`). Une valeur
+persistante pourrait théoriquement être restaurée dans un autre Context du même
+Runtime, et rquickjs ne l'empêcherait pas.
+
+- *Alternative* : notre `CachedScript` associe **atomiquement**
+  `(Context, Persistent)` et toute restauration passe par
+  `cached.ctx.with(...)` : il n'existe aucun chemin de code qui restaure une
+  valeur dans un autre contexte. Pour une garantie défense-en-profondeur, il
+  faudrait soit qu'rquickjs expose `Ctx::as_ptr()` publiquement (demande
+  upstream), soit adopter l'alternative (a) — un Runtime par entrée — auquel
+  cas la vérification de Runtime devient équivalente à une vérification de
+  Context.
+
+**c) `set_memory_limit` est un no-op avec un allocator personnalisé.**
+La documentation rquickjs précise : « Noop when a custom allocator is being
+used, as is the case for the `rust-alloc` or `allocator` features ». Notre
+workspace n'active ni l'une ni l'autre (`bindgen`, `loader`, `array-buffer`,
+`chrono`), donc la limite est effective — le test
+`resource_limits_are_applied_to_the_runtime` vérifie `malloc_limit`. Si ces
+features sont activées ultérieurement, il faut basculer sur un quota
+applicatif (compteur d'octets + rejet avant exécution) ou sur un processus
+superviseur.
+
+**d) La feature `multi-ctx` n'est pas nécessaire.** Elle ne fournit que le
+trait `MultiWith`, pour utiliser plusieurs contextes *simultanément* dans une
+même closure. Nous utilisons les realms séquentiellement (`Context::with` l'un
+après l'autre, sur un seul thread), ce que QuickJS gère nativement.
+
+**e) `BuiltinLoader` est à usage unique.** Traité au §1 par `VendorLoader`,
+sans contournement ni `unsafe`.
+
+### Risques résiduels
+
+- Un cache miss coûte ~8,5 ms (Context + 3 modules vendored recompilés par
+  realm) : c'est le prix de l'isolation. Sur un parc avec beaucoup de profils,
+  surveiller le taux de hits et ajuster `max_cached_scripts`.
+- `max_execution_time` (100 ms) couvre aussi la compilation d'un nouveau realm
+  (~8,5 ms ici). Sur une machine très lente, augmenter cette valeur ou
+  préchauffer les codecs au démarrage.
+- L'état de module persiste pour un **même** triplet `(tenant, profil, script)`
+  ; le recyclage à 10 000 appels le remet à zéro. Les codecs doivent rester
+  des fonctions pures.
+- `make test` complet (PostgreSQL / Redis / Mosquitto via Docker Compose)
+  reste indisponible dans ce bac à sable.
 
 ---
 
@@ -288,7 +525,7 @@ gateway backend (MQTT / UDP)
 
 | # | Piste | Fichier(s) | Impact attendu | Effort / risque |
 | --- | --- | --- | --- | --- |
-| 2.1 | ✅ **Appliquée** — pool de runtimes QuickJS + cache de scripts compilés, ~×40 mesuré sur le micro-benchmark. Voir « Phase 2.1 » ci-dessus. | `chirpstack/src/codec/js/mod.rs`, `config.rs`, `cmd/configfile.rs` | **Élevé**, validé par 16 tests | Fait |
+| 2.1 | ✅ **Appliquée + durcie** — pool de runtimes QuickJS, cache de scripts compilés, puis isolation par `Context`/tenant/profil, limites mémoire/stack, GC et recyclage (24 tests). Voir « Phase 2.1 » et « Durcissement sécurité de la 2.1 ». | `chirpstack/src/codec/js/mod.rs`, `codec/mod.rs`, `config.rs`, `cmd/configfile.rs`, 3 appelants | **Élevé**, ~×33–42 sur appels en cache | Fait |
 | 2.2 | Éviter `sessions.push(ds.clone())` pour chaque device candidat lors de la validation MIC : travailler par référence et ne cloner la session que sur succès. | `chirpstack/src/storage/device.rs` (~l. 347) | Moyen, proportionnel au nombre de devices partageant un DevAddr | Moyen |
 | 2.3 | Réduire les allers-retours Redis de la déduplication / du verrou Class-A (regrouper en pipeline ou Lua). | `chirpstack/src/uplink/mod.rs`, `chirpstack/src/downlink/scheduler.rs` | Moyen sur réseau dense | Moyen / risque de régression sur la concurrence |
 | 2.4 | Ajouter des métriques de latence par étape du pipeline d'uplink (histogrammes Prometheus) pour mesurer avant/après au lieu d'estimer. | `chirpstack/src/monitoring/` | Indispensable pour valider 2.1–2.3 | Faible |

@@ -106,27 +106,38 @@ Le détail des modifications du noyau est dans
   une seule fois.
 - **Phase 2.1** : le codec JavaScript ne crée plus un runtime QuickJS par trame.
   Un pool de runtimes par thread de blocking Tokio + un cache de scripts
-  compilés fait passer le micro-benchmark de ~5,3 ms à ~0,12 ms par décodage
-  (≈ ×40). Timeout par appel, isolation des entrées et reprise après erreur sont
-  conservés et testés.
+  compilés fait passer le micro-benchmark de ~8,9 ms à ~0,25 ms par décodage
+  (≈ ×35 sur les appels en cache).
+- **Durcissement 2.1 (sécurité)** : un `Context` JS dédié **par entrée de cache**
+  (clé = tenant + device profile + hash du script), limites mémoire/stack par
+  runtime, GC périodique, recyclage des workers, et erreurs propres sur OOM /
+  débordement de pile. Un codec qui modifie `Object.prototype` ou `JSON.parse`
+  ne peut plus affecter un autre profil ou un autre tenant.
 
-Nouvelles options `[codec.js]` (facultatives, valeurs par défaut indiquées) :
+Options `[codec.js]` (facultatives, valeurs par défaut indiquées) :
 
 ```toml
 [codec.js]
 max_execution_time="100ms"
 cache_scripts=true        # false = comportement amont (runtime neuf par appel)
-max_cached_scripts=64     # scripts compilés conservés par worker
+max_cached_scripts=64     # scripts compilés (realms) conservés par worker
+max_memory_bytes=33554432 # limite QuickJS par runtime (0 = illimité)
+max_stack_bytes=524288
+max_calls_per_worker=10000
+gc_every_calls=100        # 1 = GC à chaque appel (coûteux), 0 = désactivé
 ```
 
 `cache_scripts=false` est à utiliser si un codec s'appuie sur la remise à zéro
-de variables déclarées hors de `decodeUplink` / `encodeDownlink`.
+de variables déclarées hors de `decodeUplink` / `encodeDownlink`. Attention :
+`max_memory_bytes` et `max_stack_bytes` sont des limites **par Runtime**, donc
+partagées par tous les `Context` d'un même worker (limitation QuickJS 0.14,
+voir [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md)).
 
 Tests rapides :
 
 ```bash
 cargo test --offline -p chirpstack codec::js:: -- --test-threads=1
-cargo test --offline -p chirpstack codec::js::bench -- --ignored --nocapture
+cargo test --offline -p chirpstack codec::js::bench -- --ignored --nocapture --test-threads=1
 ```
 
 ## Méthode de travail

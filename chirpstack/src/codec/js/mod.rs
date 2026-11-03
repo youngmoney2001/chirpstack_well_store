@@ -1,27 +1,26 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Utc};
 use rquickjs::{CatchResultExt, Function, IntoJs, Persistent};
+use uuid::Uuid;
 
-use super::convert;
+use super::{CodecIdentity, convert};
 use crate::config;
 
 mod vendor_base64_js;
 mod vendor_buffer;
 mod vendor_ieee754;
 
-/// QuickJS runtimes are not thread-safe. Instead of creating one per codec
-/// call, a small set of blocking threads each owns a reusable runtime, context
-/// and a cache of already compiled codec entry points.
-///
-/// The semaphore bounds concurrency (and therefore the number of live
-/// runtimes) to roughly the number of CPUs: JS decoding is CPU bound, so more
-/// workers would only add contention and memory.
+/// QuickJS is not thread-safe. Each blocking thread owns one Runtime and a
+/// cache of (Context, compiled function) pairs. The semaphore bounds
+/// concurrency -- and therefore the number of live runtimes -- to roughly the
+/// number of CPUs.
 static JS_SEMAPHORE: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| {
     let workers = std::thread::available_parallelism()
         .map(|v| v.get())
@@ -30,28 +29,147 @@ static JS_SEMAPHORE: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| {
 });
 
 thread_local! {
-    /// A `thread_local` guarantees that a context is only ever used on the
-    /// thread which created it. Rust values never cross that boundary.
     static WORKER: RefCell<Option<Worker>> = const { RefCell::new(None) };
 }
 
-/// A compiled codec entry point, detached from the `ctx.with(...)` lifetime.
+/// Effective settings for one codec invocation. Read once from the global
+/// config so a config reload cannot change a job halfway through.
+#[derive(Clone, Debug)]
+struct JsSettings {
+    max_execution_time: Duration,
+    cache_scripts: bool,
+    max_cached_scripts: usize,
+    max_memory_bytes: usize,
+    max_stack_bytes: usize,
+    max_calls_per_worker: u64,
+    gc_every_calls: u64,
+}
+
+impl JsSettings {
+    fn from_config() -> Self {
+        let conf = config::get();
+        let js = &conf.codec.js;
+        JsSettings {
+            max_execution_time: js.max_execution_time,
+            cache_scripts: js.cache_scripts,
+            max_cached_scripts: js.max_cached_scripts.max(1),
+            max_memory_bytes: js.max_memory_bytes,
+            max_stack_bytes: js.max_stack_bytes,
+            max_calls_per_worker: js.max_calls_per_worker.max(1),
+            gc_every_calls: js.gc_every_calls,
+        }
+    }
+
+    /// 0 => unlimited memory, so no memory-driven recycling. Otherwise recycle
+    /// at 75% of the hard limit, before the runtime starts raising OOM errors.
+    fn recycle_memory_bytes(&self) -> usize {
+        if self.max_memory_bytes == 0 {
+            0
+        } else {
+            self.max_memory_bytes.saturating_mul(3) / 4
+        }
+    }
+
+    fn gc_due(&self, calls: u64) -> bool {
+        self.gc_every_calls > 0 && calls.is_multiple_of(self.gc_every_calls)
+    }
+}
+
+/// Reusable equivalent of `rquickjs::loader::BuiltinLoader`.
+///
+/// `BuiltinLoader::load` calls `self.modules.remove(path)`: it is a ONE-SHOT
+/// loader. With several Contexts on the same Runtime the first context takes
+/// the `buffer` source and every later context fails with
+/// "Error loading module 'buffer'". QuickJS registers modules per JSContext,
+/// so it legitimately asks the runtime loader again for each new context.
+/// This loader keeps its sources and re-declares the module in the calling
+/// context, which is exactly what a multi-realm runtime needs.
+struct VendorLoader {
+    modules: HashMap<String, Vec<u8>>,
+}
+
+impl VendorLoader {
+    fn new() -> Self {
+        let mut modules = HashMap::new();
+        modules.insert(
+            "base64-js".to_string(),
+            vendor_base64_js::SCRIPT.as_bytes().to_vec(),
+        );
+        modules.insert(
+            "ieee754".to_string(),
+            vendor_ieee754::SCRIPT.as_bytes().to_vec(),
+        );
+        modules.insert(
+            "buffer".to_string(),
+            vendor_buffer::SCRIPT.as_bytes().to_vec(),
+        );
+        VendorLoader { modules }
+    }
+}
+
+impl rquickjs::loader::Loader for VendorLoader {
+    fn load<'js>(
+        &mut self,
+        ctx: &rquickjs::Ctx<'js>,
+        name: &str,
+        _attributes: Option<rquickjs::loader::ImportAttributes<'js>>,
+    ) -> rquickjs::Result<rquickjs::Module<'js, rquickjs::module::Declared>> {
+        let source = self
+            .modules
+            .get(name)
+            .ok_or_else(|| rquickjs::Error::new_loading(name))?
+            .clone();
+        rquickjs::Module::declare(ctx.clone(), name.to_owned(), source)
+    }
+}
+
+/// A compiled codec is scoped to ONE tenant AND ONE device profile. Two
+/// profiles using byte-for-byte identical JS must never share a realm, even
+/// though hashing the script alone would give the same key.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct CacheKey {
+    tenant_id: Option<Uuid>,
+    device_profile_id: Option<Uuid>,
+    script_hash: u64,
+}
+
+impl CacheKey {
+    fn new(identity: CodecIdentity, script: &str) -> Self {
+        let mut hasher = DefaultHasher::new();
+        script.hash(&mut hasher);
+        CacheKey {
+            tenant_id: identity.tenant_id,
+            device_profile_id: identity.device_profile_id,
+            script_hash: hasher.finish(),
+        }
+    }
+}
+
+/// One cache entry = one dedicated JS realm. `Drop` frees the persistent
+/// function before the Context; `Worker::drop` frees every Context before the
+/// Runtime (rquickjs aborts the process otherwise).
 struct CachedScript {
-    /// Stored so that a (very unlikely) hash collision cannot return the
-    /// compiled form of a different script.
+    /// Full script text: makes a hash collision harmless.
     script: String,
-    entry: Persistent<Function<'static>>,
+    /// `Option` so `Drop` can release it explicitly, ahead of `ctx`.
+    entry: Option<Persistent<Function<'static>>>,
+    ctx: rquickjs::Context,
+}
+
+impl Drop for CachedScript {
+    fn drop(&mut self) {
+        drop(self.entry.take());
+    }
 }
 
 struct Worker {
-    /// MUST be dropped before `ctx`/`rt`: a `Persistent` value outliving its
-    /// runtime makes rquickjs abort the process. Fields are dropped in
-    /// declaration order, and `Drop` clears the cache explicitly as well.
-    cache: HashMap<u64, CachedScript>,
-    ctx: rquickjs::Context,
+    /// Declared first and explicitly cleared in `Drop`: must die before `rt`.
+    cache: HashMap<CacheKey, CachedScript>,
     rt: rquickjs::Runtime,
-    /// Makes every declared module name unique, even after a cache eviction.
+    /// Unique module names, even after a cache eviction.
     seq: u64,
+    /// Calls served by this runtime since it was created.
+    calls: u64,
 }
 
 impl Drop for Worker {
@@ -61,147 +179,199 @@ impl Drop for Worker {
 }
 
 impl Worker {
-    fn new() -> Result<Self> {
+    fn new(settings: &JsSettings) -> Result<Self> {
         let resolver = rquickjs::loader::BuiltinResolver::default()
             .with_module("base64-js")
             .with_module("ieee754")
             .with_module("buffer");
-        let loader = rquickjs::loader::BuiltinLoader::default()
-            .with_module("base64-js", vendor_base64_js::SCRIPT)
-            .with_module("ieee754", vendor_ieee754::SCRIPT)
-            .with_module("buffer", vendor_buffer::SCRIPT);
+        let loader = VendorLoader::new();
 
         let rt = rquickjs::Runtime::new()?;
+        // NOTE: QuickJS applies these limits to the *Runtime*, not to an
+        // individual Context. All contexts of this worker share the budget;
+        // `should_recycle` drops the whole worker as soon as it gets close.
+        rt.set_memory_limit(settings.max_memory_bytes);
+        rt.set_max_stack_size(settings.max_stack_bytes);
         rt.set_loader(resolver, loader);
-        let ctx = rquickjs::Context::full(&rt)?;
 
         Ok(Worker {
             cache: HashMap::new(),
-            ctx,
             rt,
             seq: 0,
+            calls: 0,
         })
     }
 
-    fn run(
-        &mut self,
-        job: Job,
-        max_execution_time: Duration,
-        cache_scripts: bool,
-        max_cached_scripts: usize,
-    ) -> Result<JobOutput> {
-        let key = job.cache_key();
-        let script = job.script().to_owned();
+    fn should_recycle(&self, settings: &JsSettings) -> bool {
+        if self.calls >= settings.max_calls_per_worker {
+            return true;
+        }
+        let threshold = settings.recycle_memory_bytes();
+        if threshold == 0 {
+            return false;
+        }
+        let used = self.rt.memory_usage().memory_used_size;
+        used > 0 && used as usize >= threshold
+    }
 
-        // Phase 1: resolve or compile the codec. Compilation is protected by
-        // the same timeout, but note that runtime/context creation (which used
-        // to be inside the deadline) now happens *outside* of it.
-        let deadline = SystemTime::now() + max_execution_time;
-        self.rt
-            .set_interrupt_handler(Some(Box::new(move || SystemTime::now() > deadline)));
+    fn run(&mut self, job: Job, settings: &JsSettings) -> Result<JobOutput> {
+        self.calls += 1;
+        let key = CacheKey::new(job.identity(), job.script());
+        let script = job.script().to_owned();
 
         let cache = &mut self.cache;
         let seq = &mut self.seq;
-        let context = &self.ctx;
         let runtime = &self.rt;
 
-        let compiled = context.with(|ctx| -> Result<Persistent<Function<'static>>> {
-            // Keep the legacy `chirpstack_input` global available while the
-            // user's top-level code is evaluated (upstream set it before
-            // declaring the module).
-            let input = build_input(&ctx, &job)?;
-            ctx.globals().set("chirpstack_input", input)?;
-
-            if cache_scripts && let Some(cached) = cache.get(&key).filter(|c| c.script == script) {
-                return Ok(cached.entry.clone());
-            }
-
-            let func = compile_entry(&ctx, seq, key, &script)?;
-            let persistent = Persistent::save(&ctx, func);
-
-            if cache_scripts {
-                if cache.len() >= max_cached_scripts {
-                    // Drop every persistent reference before declaring new
-                    // modules; unique module names keep this safe.
-                    cache.clear();
-                }
-                cache.insert(
-                    key,
-                    CachedScript {
-                        script: script.clone(),
-                        entry: persistent.clone(),
-                    },
-                );
-            }
-
-            Ok(persistent)
-        });
-
-        // Phase 2: refresh the deadline *outside* `ctx.with` (the runtime
-        // mutex is held by `with`, so setting the handler inside would
-        // deadlock). User code therefore always gets the full configured
-        // budget, even on a cache miss where compilation just happened.
-        let deadline = SystemTime::now() + max_execution_time;
+        // ---- Phase A: get (or create) the dedicated realm for this key. ----
+        let deadline = SystemTime::now() + settings.max_execution_time;
         runtime.set_interrupt_handler(Some(Box::new(move || SystemTime::now() > deadline)));
 
-        let out = match compiled {
-            Err(e) => Err(e),
-            Ok(entry) => context.with(|ctx| -> Result<JobOutput> {
-                let func = entry
-                    .clone()
-                    .restore(&ctx)
-                    .map_err(|e| anyhow!("Restore compiled codec: {}", e))?;
-
-                // Rebuild the input for every call and refresh the legacy
-                // global so no previous device's data can leak into this one.
-                let input = build_input(&ctx, &job)?;
-                ctx.globals().set("chirpstack_input", input.clone())?;
-
-                let res: rquickjs::Object = func
-                    .call((input,))
-                    .catch(&ctx)
-                    .map_err(|e| anyhow!("JS error: {}", e))?;
-
-                let errors: Result<Vec<String>, rquickjs::Error> = res.get("errors");
-                if let Ok(errors) = errors
-                    && !errors.is_empty()
-                {
-                    return Err(anyhow!(
-                        "{} returned errors: {}",
-                        job.name(),
-                        errors.join(", ")
-                    ));
-                }
-
-                match &job {
-                    Job::Decode { .. } => {
-                        let out = convert::rquickjs_to_struct(&res);
-                        let data = out.fields.get("data").cloned().unwrap_or_default();
-                        if let Some(pbjson_types::value::Kind::StructValue(v)) = data.kind {
-                            Ok(JobOutput::Decode(v))
-                        } else {
-                            Err(anyhow!("decodeUplink did not return 'data'"))
-                        }
-                    }
-                    Job::Encode { f_port, .. } => {
-                        let b: Vec<f64> = res.get("bytes")?;
-                        let b: Vec<u8> = b.iter().map(|v| *v as u8).collect();
-                        let f_port: f64 = res.get("fPort").unwrap_or(*f_port as f64);
-                        Ok(JobOutput::Encode((f_port as u8, b)))
-                    }
-                }
-            }),
+        let needs_compile = match cache.get(&key) {
+            Some(entry) => entry.script != script,
+            None => true,
         };
 
-        // Never leave an already expired deadline attached to a runtime which
-        // is about to be reused (or dropped).
+        if needs_compile {
+            if cache.len() >= settings.max_cached_scripts {
+                // Each CachedScript::drop frees its Persistent before its
+                // Context, so none of them outlives the Runtime.
+                cache.clear();
+            }
+
+            // Fresh Context => fresh Object.prototype, JSON, globals, Buffer.
+            let ctx = rquickjs::Context::full(runtime)?;
+            *seq += 1;
+            let module_name = format!("chirpstack-codec-{:016x}-{}", key.script_hash, *seq);
+
+            let persistent = ctx.with(|ctx| -> Result<Persistent<Function<'static>>> {
+                // The generated wrapper imports "buffer"; QuickJS resolves and
+                // compiles buffer / ieee754 / base64-js in *this* Context
+                // (its module registry is per JSContext, the loader is shared).
+                let input = build_input(&ctx, &job)?;
+                ctx.globals().set("chirpstack_input", input)?;
+                let func = compile_entry(&ctx, module_name, &script)?;
+                Ok(Persistent::save(&ctx, func))
+            })?;
+
+            cache.insert(
+                key,
+                CachedScript {
+                    script,
+                    entry: Some(persistent),
+                    ctx,
+                },
+            );
+        }
+
+        // ---- Phase B: refresh the deadline OUTSIDE ctx.with. ----
+        // Context::with holds the runtime mutex; calling set_interrupt_handler
+        // inside it would deadlock. User JS therefore always gets a full
+        // max_execution_time, even on a cache miss.
+        let deadline = SystemTime::now() + settings.max_execution_time;
+        runtime.set_interrupt_handler(Some(Box::new(move || SystemTime::now() > deadline)));
+
+        let cached = cache.get(&key).expect("cache entry was just created");
+        let entry = cached.entry.as_ref().expect("compiled entry point").clone();
+
+        let out = cached.ctx.with(|ctx| -> Result<JobOutput> {
+            let func = entry
+                .restore(&ctx)
+                .map_err(|e| anyhow!("Restore compiled codec: {}", e))?;
+
+            // Rebuild the input AND the legacy global on every call so a
+            // previous device's data cannot leak into this one.
+            let input = build_input(&ctx, &job)?;
+            ctx.globals().set("chirpstack_input", input.clone())?;
+
+            let res: rquickjs::Object = func.call((input,)).catch(&ctx).map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("out of memory") || msg.contains("Allocation") {
+                    anyhow!("JS codec memory limit exceeded: {}", msg)
+                } else {
+                    anyhow!("JS error: {}", msg)
+                }
+            })?;
+
+            let errors: Result<Vec<String>, rquickjs::Error> = res.get("errors");
+            if let Ok(errors) = errors
+                && !errors.is_empty()
+            {
+                return Err(anyhow!(
+                    "{} returned errors: {}",
+                    job.name(),
+                    errors.join(", ")
+                ));
+            }
+
+            match &job {
+                Job::Decode { .. } => {
+                    let out = convert::rquickjs_to_struct(&res);
+                    let data = out.fields.get("data").cloned().unwrap_or_default();
+                    if let Some(pbjson_types::value::Kind::StructValue(v)) = data.kind {
+                        Ok(JobOutput::Decode(v))
+                    } else {
+                        Err(anyhow!("decodeUplink did not return 'data'"))
+                    }
+                }
+                Job::Encode { f_port, .. } => {
+                    let b: Vec<f64> = res.get("bytes")?;
+                    let b: Vec<u8> = b.iter().map(|v| *v as u8).collect();
+                    let f_port: f64 = res.get("fPort").unwrap_or(*f_port as f64);
+                    Ok(JobOutput::Encode((f_port as u8, b)))
+                }
+            }
+        });
+
+        // ---- Phase C: GC (cyclic garbage), then remove the expired deadline. ----
+        if settings.gc_due(self.calls) {
+            runtime.run_gc();
+        }
         runtime.set_interrupt_handler(None);
         out
     }
 }
 
-/// Build the wrapper module. The user script is evaluated once per compiled
-/// codec; the exported function is called once per uplink/downlink.
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// A QuickJS allocation failure can surface as a Rust panic deep inside
+/// rquickjs/convert helpers. Never let it take down the process: turn it into
+/// an error, and let the caller discard the whole worker.
+fn run_guarded(worker: &mut Worker, job: Job, settings: &JsSettings) -> Result<JobOutput> {
+    match catch_unwind(AssertUnwindSafe(|| worker.run(job, settings))) {
+        Ok(out) => out,
+        Err(panic) => Err(anyhow!(
+            "JS codec engine aborted (worker discarded): {}",
+            panic_message(&panic)
+        )),
+    }
+}
+
+/// Run on an explicit worker slot. Keeping this out of the thread_local makes
+/// the recycling / isolation logic directly unit-testable.
+fn run_on_slot(slot: &mut Option<Worker>, job: Job, settings: &JsSettings) -> Result<JobOutput> {
+    if slot.is_none() {
+        *slot = Some(Worker::new(settings)?);
+    }
+    let out = run_guarded(slot.as_mut().unwrap(), job, settings);
+    let recycle = match &out {
+        Ok(_) => slot.as_ref().unwrap().should_recycle(settings),
+        Err(_) => true,
+    };
+    if recycle {
+        *slot = None;
+    }
+    out
+}
+
 fn make_script(codec_config: &str, fn_name: &str) -> String {
     let mut script = String::with_capacity(codec_config.len() + 160);
     script.push_str("import { Buffer } from \"buffer\";\n\n");
@@ -215,14 +385,10 @@ fn make_script(codec_config: &str, fn_name: &str) -> String {
 
 fn compile_entry<'js>(
     ctx: &rquickjs::Ctx<'js>,
-    seq: &mut u64,
-    key: u64,
+    module_name: String,
     script: &str,
 ) -> Result<Function<'js>> {
-    *seq += 1;
-    let name = format!("chirpstack-codec-{:016x}-{}", key, *seq);
-
-    let module = rquickjs::Module::declare(ctx.clone(), name, script.to_owned())
+    let module = rquickjs::Module::declare(ctx.clone(), module_name, script.to_owned())
         .catch(ctx)
         .map_err(|e| anyhow!("JS error: {}", e))?;
     let (module, promise) = module
@@ -268,6 +434,7 @@ fn build_input<'js>(ctx: &rquickjs::Ctx<'js>, job: &Job) -> Result<rquickjs::Obj
 #[derive(Clone)]
 enum Job {
     Decode {
+        identity: CodecIdentity,
         recv_time: DateTime<Utc>,
         f_port: u8,
         variables: HashMap<String, String>,
@@ -275,6 +442,7 @@ enum Job {
         bytes: Vec<u8>,
     },
     Encode {
+        identity: CodecIdentity,
         f_port: u8,
         variables: HashMap<String, String>,
         script: String,
@@ -283,19 +451,10 @@ enum Job {
 }
 
 impl Job {
-    fn cache_key(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
+    fn identity(&self) -> CodecIdentity {
         match self {
-            Job::Decode { script, .. } => {
-                0u8.hash(&mut hasher);
-                script.hash(&mut hasher);
-            }
-            Job::Encode { script, .. } => {
-                1u8.hash(&mut hasher);
-                script.hash(&mut hasher);
-            }
+            Job::Decode { identity, .. } | Job::Encode { identity, .. } => *identity,
         }
-        hasher.finish()
     }
 
     fn script(&self) -> &str {
@@ -317,49 +476,34 @@ enum JobOutput {
     Encode((u8, Vec<u8>)),
 }
 
-/// Run a codec job on a pooled blocking worker.
-async fn execute(job: Job) -> Result<JobOutput> {
-    let conf = config::get();
-    let max_execution_time = conf.codec.js.max_execution_time;
-    let cache_scripts = conf.codec.js.cache_scripts;
-    let max_cached_scripts = conf.codec.js.max_cached_scripts.max(1);
-
+async fn execute_with_settings(job: Job, settings: JsSettings) -> Result<JobOutput> {
     let _permit = JS_SEMAPHORE
         .acquire()
         .await
         .map_err(|e| anyhow!("Acquire JS codec worker: {}", e))?;
 
     tokio::task::spawn_blocking(move || -> Result<JobOutput> {
-        if !cache_scripts {
-            // Legacy behaviour: one completely fresh runtime per call. Useful
-            // for codecs relying on top-level state being reset every time.
-            let mut worker = Worker::new()?;
-            return worker.run(job, max_execution_time, false, max_cached_scripts);
+        if !settings.cache_scripts {
+            // Legacy behaviour: a completely fresh Runtime + Context per call.
+            let mut worker = Worker::new(&settings)?;
+            return run_guarded(&mut worker, job, &settings);
         }
 
-        WORKER.with(|slot| -> Result<JobOutput> {
-            let mut slot = slot.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(Worker::new()?);
-            }
-            let out = slot
-                .as_mut()
-                .unwrap()
-                .run(job, max_execution_time, true, max_cached_scripts);
-            if out.is_err() {
-                // A throwing or timed-out script can leave QuickJS in an
-                // inconsistent state. Never hand that runtime to another
-                // device; rebuild it on the next call.
-                *slot = None;
-            }
-            out
+        WORKER.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            run_on_slot(&mut slot, job, &settings)
         })
     })
     .await
     .context("JS codec worker panicked")?
 }
 
+async fn execute(job: Job) -> Result<JobOutput> {
+    execute_with_settings(job, JsSettings::from_config()).await
+}
+
 pub async fn decode(
+    identity: CodecIdentity,
     recv_time: DateTime<Utc>,
     f_port: u8,
     variables: &HashMap<String, String>,
@@ -367,6 +511,7 @@ pub async fn decode(
     b: &[u8],
 ) -> Result<pbjson_types::Struct> {
     let out = execute(Job::Decode {
+        identity,
         recv_time,
         f_port,
         variables: variables.clone(),
@@ -382,12 +527,14 @@ pub async fn decode(
 }
 
 pub async fn encode(
+    identity: CodecIdentity,
     f_port: u8,
     variables: &HashMap<String, String>,
     encode_config: &str,
     s: &prost_types::Struct,
 ) -> Result<(u8, Vec<u8>)> {
     let out = execute(Job::Encode {
+        identity,
         f_port,
         variables: variables.clone(),
         script: make_script(encode_config, "encodeDownlink"),
@@ -402,9 +549,74 @@ pub async fn encode(
 }
 
 #[cfg(test)]
+fn pooled_settings() -> JsSettings {
+    let mut settings = JsSettings::from_config();
+    settings.cache_scripts = true;
+    settings
+}
+
+#[cfg(test)]
+async fn decode_with_settings(
+    identity: CodecIdentity,
+    f_port: u8,
+    script: &str,
+    bytes: &[u8],
+    settings: JsSettings,
+) -> anyhow::Result<pbjson_types::Struct> {
+    let job = Job::Decode {
+        identity,
+        recv_time: Utc::now(),
+        f_port,
+        variables: HashMap::new(),
+        script: make_script(script, "decodeUplink"),
+        bytes: bytes.to_vec(),
+    };
+    match execute_with_settings(job, settings).await? {
+        JobOutput::Decode(v) => Ok(v),
+        JobOutput::Encode(_) => Err(anyhow!("Unexpected JS codec output for decode")),
+    }
+}
+
+#[cfg(test)]
 pub mod test {
     use super::*;
     use chrono::TimeZone;
+
+    // The production API now requires a caller identity for cache isolation.
+    // Keep the upstream test bodies untouched by providing local shims.
+    async fn decode(
+        recv_time: DateTime<Utc>,
+        f_port: u8,
+        variables: &HashMap<String, String>,
+        decoder: &str,
+        b: &[u8],
+    ) -> anyhow::Result<pbjson_types::Struct> {
+        super::decode(
+            crate::codec::CodecIdentity::default(),
+            recv_time,
+            f_port,
+            variables,
+            decoder,
+            b,
+        )
+        .await
+    }
+
+    async fn encode(
+        f_port: u8,
+        variables: &HashMap<String, String>,
+        encoder: &str,
+        s: &prost_types::Struct,
+    ) -> anyhow::Result<(u8, Vec<u8>)> {
+        super::encode(
+            crate::codec::CodecIdentity::default(),
+            f_port,
+            variables,
+            encoder,
+            s,
+        )
+        .await
+    }
 
     #[tokio::test]
     pub async fn test_decode_timeout() {
@@ -668,12 +880,8 @@ mod bench {
     use super::*;
     use std::time::Instant;
 
-    // Manual micro-benchmark, run with:
-    //   cargo test --offline -p chirpstack codec::js::bench -- --ignored --nocapture
-    #[tokio::test]
-    #[ignore = "manual benchmark"]
-    async fn bench_decode() {
-        let decoder = r#"
+    fn decoder() -> String {
+        r#"
             function decodeUplink(input) {
                 var buf = new Buffer(input.bytes);
                 return {
@@ -685,41 +893,87 @@ mod bench {
                 };
             }
         "#
-        .to_string();
-        let vars: HashMap<String, String> = HashMap::new();
+        .to_string()
+    }
 
-        // Warm up (the first call also compiles the vendored buffer/ieee754 modules).
-        let _ = decode(Utc::now(), 10, &vars, &decoder, &[1, 2, 3, 4]).await;
+    async fn bench_once(label: &str, settings: JsSettings) {
+        let script = decoder();
+        let identity = CodecIdentity::default();
+
+        // Warm up (also compiles the vendored buffer/ieee754 modules).
+        let _ = decode_with_settings(identity, 10, &script, &[1, 2, 3, 4], settings.clone()).await;
 
         let iterations = 200;
         let start = Instant::now();
         for _ in 0..iterations {
-            decode(Utc::now(), 10, &vars, &decoder, &[1, 2, 3, 4])
+            decode_with_settings(identity, 10, &script, &[1, 2, 3, 4], settings.clone())
                 .await
                 .unwrap();
         }
         let elapsed = start.elapsed();
         println!(
-            "decode x{}: {:?} ({:?}/call)",
-            iterations,
-            elapsed,
+            "{label}: decode x{iterations}: {elapsed:?} ({:?}/call)",
+            elapsed / iterations
+        );
+    }
+
+    // Run with:
+    //   cargo test --offline -p chirpstack codec::js::bench -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "manual benchmark"]
+    async fn bench_decode() {
+        bench_once("pooled, gc=default", pooled_settings()).await;
+
+        let mut every_call = pooled_settings();
+        every_call.gc_every_calls = 1;
+        bench_once("pooled, gc=1", every_call).await;
+
+        let mut without_gc = pooled_settings();
+        without_gc.gc_every_calls = 0;
+        bench_once("pooled, gc=0", without_gc).await;
+
+        let mut legacy = pooled_settings();
+        legacy.cache_scripts = false;
+        bench_once("legacy (fresh runtime)", legacy).await;
+    }
+
+    // Cost of a cache miss: a new Context + vendored modules for a new key.
+    #[tokio::test]
+    #[ignore = "manual benchmark"]
+    async fn bench_cache_miss() {
+        let script = "function decodeUplink(i) { return { data: { ok: i.fPort } }; }";
+        let settings = pooled_settings();
+        let iterations = 40;
+        let start = Instant::now();
+        for i in 0..iterations {
+            let id = CodecIdentity {
+                tenant_id: Some(Uuid::from_u128(1)),
+                device_profile_id: Some(Uuid::from_u128(i as u128 + 1000)),
+            };
+            decode_with_settings(id, 1, script, &[1], settings.clone())
+                .await
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "cache miss x{iterations}: {elapsed:?} ({:?}/call)",
             elapsed / iterations
         );
     }
 }
 
-/// Regression tests for the pooled QuickJS runtime / compiled-script cache.
+/// Security / isolation / resource-limit regression tests for the hardened
+/// QuickJS pool. A local `Option<Worker>` slot is used wherever a test needs
+/// determinism (Tokio may dispatch blocking jobs to different threads).
 #[cfg(test)]
 mod pool_test {
     use super::*;
+    use std::time::Instant;
 
-    fn decode_job(port: u8, bytes: &[u8], script: &str) -> Job {
-        Job::Decode {
-            recv_time: Utc::now(),
-            f_port: port,
-            variables: HashMap::new(),
-            script: make_script(script, "decodeUplink"),
-            bytes: bytes.to_vec(),
+    fn identity(tenant: u128, profile: u128) -> CodecIdentity {
+        CodecIdentity {
+            tenant_id: Some(Uuid::from_u128(tenant)),
+            device_profile_id: Some(Uuid::from_u128(profile)),
         }
     }
 
@@ -737,8 +991,34 @@ mod pool_test {
         }
     }
 
-    #[tokio::test]
-    async fn input_is_refreshed_on_every_call() {
+    fn decode_job(id: CodecIdentity, port: u8, bytes: &[u8], script: &str) -> Job {
+        Job::Decode {
+            identity: id,
+            recv_time: Utc::now(),
+            f_port: port,
+            variables: HashMap::new(),
+            script: make_script(script, "decodeUplink"),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn run_decode(
+        slot: &mut Option<Worker>,
+        id: CodecIdentity,
+        port: u8,
+        bytes: &[u8],
+        script: &str,
+        settings: &JsSettings,
+    ) -> Result<pbjson_types::Struct> {
+        Ok(as_decode(run_on_slot(
+            slot,
+            decode_job(id, port, bytes, script),
+            settings,
+        )?))
+    }
+
+    #[test]
+    fn input_is_refreshed_on_every_call() {
         let decoder = r#"
             function decodeUplink(input) {
                 return { data: {
@@ -748,77 +1028,75 @@ mod pool_test {
                 }};
             }
         "#;
-        let vars: HashMap<String, String> = HashMap::new();
+        let mut slot = None;
+        let settings = pooled_settings();
 
-        // Same compiled script, varying input: neither the function argument
-        // nor the legacy global may retain a previous device's data.
         for (port, byte) in [(5u8, 0x11u8), (9, 0x22), (5, 0x33)] {
-            let out = decode(Utc::now(), port, &vars, decoder, &[byte])
-                .await
-                .unwrap();
+            let out =
+                run_decode(&mut slot, identity(1, 1), port, &[byte], decoder, &settings).unwrap();
             assert_eq!(number(&out, "from_arg"), port as f64);
             assert_eq!(number(&out, "from_global"), port as f64);
             assert_eq!(number(&out, "first_byte"), byte as f64);
         }
     }
 
-    #[tokio::test]
-    async fn multiple_scripts_can_coexist_in_the_cache() {
+    #[test]
+    fn multiple_scripts_can_coexist_in_the_cache() {
         let first = "function decodeUplink(i) { return { data: { v: 1 } }; }";
         let second = "function decodeUplink(i) { return { data: { v: 2 } }; }";
-        let vars: HashMap<String, String> = HashMap::new();
+        let mut slot = None;
+        let settings = pooled_settings();
 
         for (script, expected) in [(first, 1.0), (second, 2.0), (first, 1.0), (second, 2.0)] {
-            let out = decode(Utc::now(), 1, &vars, script, &[1]).await.unwrap();
+            let out = run_decode(&mut slot, identity(1, 1), 1, &[1], script, &settings).unwrap();
             assert_eq!(number(&out, "v"), expected);
         }
+        assert_eq!(slot.as_ref().unwrap().cache.len(), 2);
     }
 
-    #[tokio::test]
-    async fn recovers_after_js_error() {
+    #[test]
+    fn recovers_after_js_error() {
         let bad = "function decodeUplink(i) { return foo; }";
         let good = "function decodeUplink(i) { return { data: { ok: i.fPort } }; }";
-        let vars: HashMap<String, String> = HashMap::new();
+        let mut slot = None;
+        let settings = pooled_settings();
 
-        assert!(decode(Utc::now(), 1, &vars, bad, &[1]).await.is_err());
-        let out = decode(Utc::now(), 7, &vars, good, &[1]).await.unwrap();
+        assert!(run_decode(&mut slot, identity(1, 1), 1, &[1], bad, &settings).is_err());
+        assert!(slot.is_none(), "a poisoned worker must never be reused");
+        let out = run_decode(&mut slot, identity(1, 1), 7, &[1], good, &settings).unwrap();
         assert_eq!(number(&out, "ok"), 7.0);
     }
 
-    #[tokio::test]
-    async fn timeout_is_refreshed_for_a_cached_script() {
+    #[test]
+    fn timeout_is_refreshed_for_a_cached_script() {
         let decoder = r#"
             function decodeUplink(input) {
-                if (input.bytes[0] === 1) {
-                    while (true) {}
-                }
+                if (input.bytes[0] === 1) { while (true) {} }
                 return { data: { ok: input.fPort } };
             }
         "#;
-        let vars: HashMap<String, String> = HashMap::new();
+        let mut slot = None;
+        let settings = pooled_settings();
 
-        // Warm the compiled-script cache with a benign call.
-        let out = decode(Utc::now(), 3, &vars, decoder, &[2]).await.unwrap();
+        let out = run_decode(&mut slot, identity(1, 1), 3, &[2], decoder, &settings).unwrap();
         assert_eq!(number(&out, "ok"), 3.0);
-
-        // Same compiled function: the per-call deadline must still interrupt
-        // an infinite loop, and the poisoned worker must be discarded.
-        assert!(decode(Utc::now(), 3, &vars, decoder, &[1]).await.is_err());
-
-        let out = decode(Utc::now(), 4, &vars, decoder, &[2]).await.unwrap();
+        assert!(run_decode(&mut slot, identity(1, 1), 3, &[1], decoder, &settings).is_err());
+        assert!(slot.is_none(), "timed-out worker must be discarded");
+        let out = run_decode(&mut slot, identity(1, 1), 4, &[2], decoder, &settings).unwrap();
         assert_eq!(number(&out, "ok"), 4.0);
     }
 
     #[tokio::test]
     async fn concurrent_decodes_are_isolated() {
         let decoder = "function decodeUplink(i) { return { data: { port: i.fPort } }; }";
+        let settings = pooled_settings();
         let mut handles = Vec::new();
 
         for port in 0..16u8 {
             let script = decoder.to_string();
+            let settings = settings.clone();
             handles.push(tokio::spawn(async move {
-                let vars: HashMap<String, String> = HashMap::new();
-                decode(Utc::now(), port, &vars, &script, &[port])
+                decode_with_settings(identity(1, 1), port, &script, &[port], settings)
                     .await
                     .unwrap()
             }));
@@ -839,17 +1117,14 @@ mod pool_test {
                 return { data: { counter: counter } };
             }
         "#;
-        let job = decode_job(1, &[1], script);
-        let mut worker = Worker::new().unwrap();
+        let settings = pooled_settings();
+        let job = decode_job(identity(1, 1), 1, &[1], script);
+        let mut worker = Worker::new(&settings).unwrap();
 
-        // Top-level state survives between calls: this is the (documented)
-        // semantic difference introduced by reusing a runtime.
+        // Documented semantic difference vs upstream: module-level state
+        // survives between calls of the SAME (tenant, profile, script).
         for expected in [1.0, 2.0, 3.0] {
-            let out = as_decode(
-                worker
-                    .run(job.clone(), Duration::from_millis(100), true, 64)
-                    .unwrap(),
-            );
+            let out = as_decode(worker.run(job.clone(), &settings).unwrap());
             assert_eq!(number(&out, "counter"), expected);
         }
     }
@@ -863,39 +1138,260 @@ mod pool_test {
                 return { data: { counter: counter } };
             }
         "#;
-        let job = decode_job(1, &[1], script);
+        let settings = pooled_settings();
+        let job = decode_job(identity(1, 1), 1, &[1], script);
 
-        // cache_scripts=false mirrors execute()'s legacy branch: a fresh
-        // runtime per call, so top-level state starts over each time.
+        // cache_scripts=false creates a fresh Worker per call in execute().
         for _ in 0..3 {
-            let mut worker = Worker::new().unwrap();
-            let out = as_decode(
-                worker
-                    .run(job.clone(), Duration::from_millis(100), false, 64)
-                    .unwrap(),
-            );
+            let mut worker = Worker::new(&settings).unwrap();
+            let out = as_decode(worker.run(job.clone(), &settings).unwrap());
             assert_eq!(number(&out, "counter"), 1.0);
         }
     }
 
     #[test]
     fn cache_is_bounded() {
-        let mut worker = Worker::new().unwrap();
+        let mut settings = pooled_settings();
+        settings.max_cached_scripts = 2;
+        let mut worker = Worker::new(&settings).unwrap();
 
         for i in 0..10u8 {
             let script = format!(
                 "function decodeUplink(input) {{ return {{ data: {{ v: {} }} }}; }}",
                 i
             );
-            let job = decode_job(1, &[1], &script);
-            let out = as_decode(
-                worker
-                    .run(job, Duration::from_millis(100), true, 2)
-                    .unwrap(),
-            );
+            let job = decode_job(identity(1, 1), 1, &[1], &script);
+            let out = as_decode(worker.run(job, &settings).unwrap());
             assert_eq!(number(&out, "v"), i as f64);
         }
-
         assert!(worker.cache.len() <= 2);
+    }
+
+    /// HARDENING 1: one Context per cache entry, even for identical script
+    /// text. A codec poisoning Object.prototype / JSON must not affect the
+    /// realm of another device profile.
+    #[test]
+    fn prototype_and_json_pollution_is_confined_to_one_profile() {
+        let polluter = r#"
+            function decodeUplink(input) {
+                if (input.bytes[0] === 1) {
+                    Object.prototype.x = 'poisoned';
+                    JSON.parse = function () { return { hijacked: true }; };
+                    return { data: { done: 1 } };
+                }
+                var probe = {};
+                var parsed = JSON.parse('{"ok":1}');
+                return { data: {
+                    leaked_x: (probe.x === undefined) ? 0 : 1,
+                    json_ok: (parsed.ok === 1) ? 1 : 0
+                }};
+            }
+        "#;
+        let other_script = r#"
+            function decodeUplink(input) {
+                var probe = {};
+                var parsed = JSON.parse('{"ok":1}');
+                return { data: {
+                    leaked_x: (probe.x === undefined) ? 0 : 1,
+                    json_ok: (parsed.ok === 1) ? 1 : 0
+                }};
+            }
+        "#;
+        let mut slot = None;
+        let settings = pooled_settings();
+
+        // Same text, two different profiles: the second realm must be clean.
+        run_decode(&mut slot, identity(1, 1), 1, &[1], polluter, &settings).unwrap();
+        for script in [polluter, other_script] {
+            let out = run_decode(&mut slot, identity(1, 2), 1, &[2], script, &settings).unwrap();
+            assert_eq!(number(&out, "leaked_x"), 0.0, "Object.prototype leaked");
+            assert_eq!(number(&out, "json_ok"), 1.0, "JSON.parse was replaced");
+        }
+        // A third, unrelated tenant/profile is clean too.
+        let out = run_decode(&mut slot, identity(2, 3), 1, &[2], other_script, &settings).unwrap();
+        assert_eq!(number(&out, "leaked_x"), 0.0);
+        assert_eq!(number(&out, "json_ok"), 1.0);
+    }
+
+    /// HARDENING 2: the cache key includes tenant + device profile, so the
+    /// identical script text cannot share module-level state across tenants.
+    #[test]
+    fn same_script_is_not_shared_between_tenants_or_profiles() {
+        let script = r#"
+            var counter = 0;
+            function decodeUplink(i) {
+                counter++;
+                return { data: { counter: counter } };
+            }
+        "#;
+        let a = identity(1, 10);
+        let b = identity(2, 20);
+        let mut slot = None;
+        let settings = pooled_settings();
+
+        for (id, expected) in [(a, 1.0), (a, 2.0), (b, 1.0), (a, 3.0), (b, 2.0), (a, 4.0)] {
+            let out = run_decode(&mut slot, id, 1, &[1], script, &settings).unwrap();
+            assert_eq!(number(&out, "counter"), expected);
+        }
+        assert_eq!(slot.as_ref().unwrap().cache.len(), 2);
+    }
+
+    /// HARDENING 1 (structural): two entries really own two distinct JS
+    /// contexts, while sharing a single Runtime.
+    #[test]
+    fn each_cache_entry_has_its_own_context() {
+        let script = "function decodeUplink(i) { return { data: { ok: 1 } }; }";
+        let mut slot = None;
+        let settings = pooled_settings();
+
+        run_decode(&mut slot, identity(1, 1), 1, &[1], script, &settings).unwrap();
+        run_decode(&mut slot, identity(1, 2), 1, &[1], script, &settings).unwrap();
+
+        let worker = slot.as_ref().unwrap();
+        assert_eq!(worker.cache.len(), 2);
+        let ptrs: Vec<usize> = worker
+            .cache
+            .values()
+            .map(|e| e.ctx.as_raw().as_ptr() as usize)
+            .collect();
+        assert_ne!(ptrs[0], ptrs[1], "contexts must not be shared");
+    }
+
+    /// HARDENING 3: memory limit is applied to every runtime of the pool.
+    #[test]
+    fn resource_limits_are_applied_to_the_runtime() {
+        let mut settings = pooled_settings();
+        settings.max_memory_bytes = 4 * 1024 * 1024;
+        settings.max_stack_bytes = 256 * 1024;
+        let worker = Worker::new(&settings).unwrap();
+        let usage = worker.rt.memory_usage();
+        assert_eq!(usage.malloc_limit as usize, settings.max_memory_bytes);
+    }
+
+    /// HARDENING 3: runaway allocation produces a clean error (no process
+    /// abort), discards the worker, and the next call works again.
+    #[test]
+    fn memory_limit_returns_error_and_discards_worker() {
+        let mut settings = pooled_settings();
+        settings.max_memory_bytes = 8 * 1024 * 1024;
+        settings.max_execution_time = Duration::from_secs(2);
+        settings.gc_every_calls = 0;
+        let hog = r#"
+            function decodeUplink(input) {
+                var sink = [];
+                while (true) { sink.push(new Array(20000).fill(7)); }
+            }
+        "#;
+        let healthy = "function decodeUplink(i) { return { data: { ok: 1 } }; }";
+        let mut slot = None;
+
+        let err = run_decode(&mut slot, identity(1, 1), 1, &[1], hog, &settings)
+            .expect_err("allocation loop must fail");
+        println!("memory-limit error: {err:#}");
+        assert!(slot.is_none(), "OOM worker must be discarded");
+
+        let out = run_decode(&mut slot, identity(1, 2), 1, &[1], healthy, &settings).unwrap();
+        assert_eq!(number(&out, "ok"), 1.0);
+    }
+
+    /// HARDENING 3: unbounded recursion is caught by the JS stack limit.
+    #[test]
+    fn stack_overflow_returns_error_without_crashing() {
+        let mut settings = pooled_settings();
+        settings.max_stack_bytes = 128 * 1024;
+        settings.max_execution_time = Duration::from_secs(2);
+        settings.gc_every_calls = 0;
+        let recursive = "function decodeUplink(i) { return decodeUplink(i); }";
+        let healthy = "function decodeUplink(i) { return { data: { ok: 1 } }; }";
+        let mut slot = None;
+
+        let err = run_decode(&mut slot, identity(1, 1), 1, &[1], recursive, &settings)
+            .expect_err("infinite recursion must fail");
+        println!("stack-limit error: {err:#}");
+        assert!(slot.is_none());
+
+        let out = run_decode(&mut slot, identity(1, 2), 1, &[1], healthy, &settings).unwrap();
+        assert_eq!(number(&out, "ok"), 1.0);
+    }
+
+    /// HARDENING 3: recycling after N calls yields identical results while
+    /// resetting module-level state (proof the worker really was replaced).
+    #[test]
+    fn worker_is_recycled_after_max_calls_per_worker() {
+        let mut settings = pooled_settings();
+        settings.max_calls_per_worker = 3;
+        settings.max_memory_bytes = 0; // unlimited => no memory-driven recycle
+        settings.gc_every_calls = 0;
+        let script = r#"
+            var counter = 0;
+            function decodeUplink(i) {
+                counter++;
+                return { data: { counter: counter } };
+            }
+        "#;
+        let mut slot = None;
+
+        for expected in [1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0] {
+            let out = run_decode(&mut slot, identity(1, 1), 1, &[1], script, &settings).unwrap();
+            assert_eq!(number(&out, "counter"), expected);
+        }
+    }
+
+    /// One Context per cached script is more expensive than one shared realm;
+    /// verify that a full cache still fits inside the configured hard limit.
+    #[test]
+    fn a_full_cache_stays_within_the_memory_limit() {
+        let mut settings = pooled_settings();
+        settings.gc_every_calls = 0;
+        let script = "function decodeUplink(i) { return { data: { ok: 1 } }; }";
+        let mut worker = Worker::new(&settings).unwrap();
+
+        for i in 0..settings.max_cached_scripts as u128 {
+            let job = decode_job(identity(1, i), 1, &[1], script);
+            let out = as_decode(worker.run(job, &settings).unwrap());
+            assert_eq!(number(&out, "ok"), 1.0);
+        }
+
+        let used = worker.rt.memory_usage().memory_used_size as usize;
+        println!(
+            "memory_used_size with {} contexts: {} bytes (hard limit {})",
+            worker.cache.len(),
+            used,
+            settings.max_memory_bytes
+        );
+        assert_eq!(worker.cache.len(), settings.max_cached_scripts);
+        assert!(used < settings.max_memory_bytes);
+        assert!(used < settings.recycle_memory_bytes());
+    }
+
+    /// JS_RunGC walks every context of the runtime, so its cost must be
+    /// measured with a FULL cache, not with a single realm.
+    #[test]
+    #[ignore = "manual benchmark"]
+    fn bench_gc_with_a_full_cache() {
+        let script = "function decodeUplink(i) { return { data: { ok: 1 } }; }";
+        let mut settings = pooled_settings();
+        settings.gc_every_calls = 0;
+        let mut worker = Worker::new(&settings).unwrap();
+
+        for i in 0..settings.max_cached_scripts as u128 {
+            worker
+                .run(decode_job(identity(1, i), 1, &[1], script), &settings)
+                .unwrap();
+        }
+
+        let job = decode_job(identity(1, 0), 1, &[1], script);
+        for gc in [0u64, 1, 100] {
+            settings.gc_every_calls = gc;
+            let start = Instant::now();
+            for _ in 0..200 {
+                worker.run(job.clone(), &settings).unwrap();
+            }
+            println!(
+                "{} contexts, gc={gc}: {:?}/call",
+                worker.cache.len(),
+                start.elapsed() / 200
+            );
+        }
     }
 }

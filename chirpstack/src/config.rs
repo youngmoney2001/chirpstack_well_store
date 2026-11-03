@@ -440,13 +440,27 @@ pub struct Codec {
 pub struct CodecJs {
     #[serde(with = "humantime_serde")]
     pub max_execution_time: Duration,
-    /// Reuse QuickJS runtimes and already compiled codec scripts across calls
-    /// instead of creating a runtime for every single uplink/downlink.
-    /// Set to false to get the upstream behaviour (fresh runtime per call),
-    /// which is needed by codecs relying on top-level state being reset.
+    /// Reuse QuickJS runtimes and already compiled codec scripts across calls.
+    /// `false` restores the upstream behaviour (fresh Runtime + Context per
+    /// call). Enabled by default only after the isolation/resource-limit
+    /// hardening was validated by the tests described in
+    /// docs/OPTIMIZATIONS.md (phase 2.1 hardening). Set to false for a strictly
+    /// upstream-equivalent realm-per-call deployment.
     pub cache_scripts: bool,
-    /// Maximum number of compiled scripts kept per pooled worker.
+    /// Maximum number of compiled scripts (and therefore JS realms) cached
+    /// per worker.
     pub max_cached_scripts: usize,
+    /// Hard QuickJS memory limit per runtime. 0 = unlimited (not recommended).
+    /// NOTE: QuickJS applies this per JSRuntime, so it is shared by all
+    /// contexts of a pooled worker.
+    pub max_memory_bytes: usize,
+    /// Maximum JS stack size per runtime.
+    pub max_stack_bytes: usize,
+    /// Recycle a pooled worker after this many calls, so long-lived state
+    /// (atoms, shapes, cyclic garbage, tampered intrinsics) cannot accumulate.
+    pub max_calls_per_worker: u64,
+    /// Run a full GC every N calls. 1 = after every call, 0 = never.
+    pub gc_every_calls: u64,
 }
 
 impl Default for CodecJs {
@@ -455,6 +469,14 @@ impl Default for CodecJs {
             max_execution_time: Duration::from_millis(100),
             cache_scripts: true,
             max_cached_scripts: 64,
+            max_memory_bytes: 32 * 1024 * 1024,
+            max_stack_bytes: 512 * 1024,
+            max_calls_per_worker: 10_000,
+            // JS_RunGC walks EVERY context of the runtime. Measured with a
+            // full 64-context cache: gc=1 => 8.1-8.4 ms/call, gc=100 =>
+            // 0.10-0.12 ms/call, gc=0 => 0.018 ms/call. See
+            // docs/OPTIMIZATIONS.md, section "Durcissement securite de la 2.1".
+            gc_every_calls: 100,
         }
     }
 }

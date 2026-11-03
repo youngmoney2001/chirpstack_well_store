@@ -655,11 +655,28 @@ pub fn run() {
     max_execution_time="{{ codec.js.max_execution_time }}"
 
     # Reuse QuickJS runtimes and compiled codec scripts between calls.
-    # Disable this if a codec relies on top-level state being reset on every call.
+    # Each cached script gets its own JS Context, keyed by tenant + device
+    # profile. Set to false for the upstream behaviour (fresh runtime per call).
     cache_scripts={{ codec.js.cache_scripts }}
 
     # Maximum number of compiled scripts cached per worker.
     max_cached_scripts={{ codec.js.max_cached_scripts }}
+
+    # QuickJS hard memory limit, in bytes (0 = unlimited).
+    # Note: this limit is per Runtime, shared by all contexts of a worker.
+    max_memory_bytes={{ codec.js.max_memory_bytes }}
+
+    # Maximum JS stack size, in bytes.
+    max_stack_bytes={{ codec.js.max_stack_bytes }}
+
+    # Recycle a pooled worker after this many calls (and when memory usage
+    # reaches 75% of max_memory_bytes).
+    max_calls_per_worker={{ codec.js.max_calls_per_worker }}
+
+    # Run a full GC every N calls (1 = every call, 0 = disabled).
+    # JS_RunGC walks all cached contexts: with 64 cached scripts, 1 costs
+    # ~8.2 ms per decode while 100 costs ~0.11 ms.
+    gc_every_calls={{ codec.js.gc_every_calls }}
 
 
 # User authentication configuration.

@@ -951,6 +951,10 @@ impl Data {
         if !self._is_end_to_end_encrypted() {
             pl.object = match codec::binary_to_struct(
                 dp.payload_codec_runtime,
+                codec::CodecIdentity {
+                    tenant_id: dp.tenant_id.map(Into::into),
+                    device_profile_id: Some(dp.id.into()),
+                },
                 ts,
                 mac.f_port.unwrap_or(0),
                 &dev.variables,

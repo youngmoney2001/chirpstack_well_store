@@ -76,8 +76,21 @@ impl FromStr for Codec {
     }
 }
 
+/// Identity of the caller of a JS codec.
+///
+/// It is part of the compiled-script cache key: two tenants, or two device
+/// profiles, must never share a JS realm even when they use byte-for-byte
+/// identical codec scripts. Without this, a script declaring state at module
+/// scope could observe or poison another tenant's codec.
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+pub struct CodecIdentity {
+    pub tenant_id: Option<uuid::Uuid>,
+    pub device_profile_id: Option<uuid::Uuid>,
+}
+
 pub async fn binary_to_struct(
     codec: Codec,
+    identity: CodecIdentity,
     recv_time: DateTime<Utc>,
     f_port: u8,
     variables: &HashMap<String, String>,
@@ -87,12 +100,15 @@ pub async fn binary_to_struct(
     Ok(match codec {
         Codec::NONE => None,
         Codec::CAYENNE_LPP => Some(cayenne_lpp::decode(b).context("CayenneLpp decode")?),
-        Codec::JS => Some(js::decode(recv_time, f_port, variables, decoder_config, b).await?),
+        Codec::JS => {
+            Some(js::decode(identity, recv_time, f_port, variables, decoder_config, b).await?)
+        }
     })
 }
 
 pub async fn struct_to_binary(
     codec: Codec,
+    identity: CodecIdentity,
     f_port: u8,
     variables: &HashMap<String, String>,
     encoder_config: &str,
@@ -104,7 +120,7 @@ pub async fn struct_to_binary(
             f_port,
             cayenne_lpp::encode(obj).context("CayenneLpp encode")?,
         ),
-        Codec::JS => js::encode(f_port, variables, encoder_config, obj).await?,
+        Codec::JS => js::encode(identity, f_port, variables, encoder_config, obj).await?,
     })
 }
 

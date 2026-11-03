@@ -1147,6 +1147,10 @@ impl DeviceService for Device {
 
             (f_port, data) = codec::struct_to_binary(
                 dp.payload_codec_runtime,
+                codec::CodecIdentity {
+                    tenant_id: dp.tenant_id.map(Into::into),
+                    device_profile_id: Some(dp.id.into()),
+                },
                 req_qi.f_port as u8,
                 &dev.variables,
                 &dp.payload_codec_script,
