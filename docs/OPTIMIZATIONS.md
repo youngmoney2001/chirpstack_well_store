@@ -5,19 +5,34 @@ Ce document est le **journal de bord** de nos écarts par rapport à l'amont :
 chaque modification du noyau doit y être décrite (motivation, impact, risque,
 vérification) pour rester rebasable sur les futures versions.
 
-## Contrainte de l'environnement de travail
+## Environnement de travail
 
-Le bac à sable ne dispose pas de `rustc` / `cargo` et n'accède pas à `crates.io` :
-**ni compilation ni `make test` ne sont possibles ici**. Pour chaque patch :
+**Toolchain installé** : Rust 1.99.0 autonome (`rustc`, `cargo`, `rust-std`,
+`rustfmt`, `clippy`), sur le `PATH`. Comme `static.rust-lang.org` / `sh.rustup.rs`
+/ `deb.debian.org` sont bloqués, il provient des composants officiels Rust
+repackagés sur `registry.npmjs.org` via `scripts/install-rust-toolchain.sh`.
+Le `rust-toolchain.toml` (1.89.0) n'est lu que par `rustup`, donc ignoré ici.
 
-- relecture du code et de l'équivalence fonctionnelle avec l'amont ;
-- analyse syntaxique des fichiers Rust modifiés avec `tree-sitter-rust`
-  (comparaison du nombre d'erreurs avec les fichiers amont : 0 partout) ;
-- reproductible avec `scripts/check_rust_syntax.py` (optionnel, voir plus bas).
+**Limite restante** : `crates.io` (`index.crates.io`, `static.crates.io`) est
+inaccessible → `cargo check` s'arrête sur `no matching package named 'aes' found`
+en mode `--offline`, et part en timeouts réseau sinon. `cargo build` / `make test`
+nécessitent donc un `vendor/` généré sur une machine connectée, ou l'ouverture
+de l'accès à crates.io dans le bac à sable.
 
-La confirmation définitive (`cargo build -p chirpstack`, `make test`,
-`cargo clippy`) doit être faite sur un poste avec la toolchain `1.89.0` et les
-services Docker Compose.
+Pour chaque patch, les vérifications réalisables ici sont :
+
+- relecture + `diff` contre l'amont ;
+- `rustfmt --edition 2024 --config skip_children=true --check` (vrai parseur Rust) ;
+- `cargo metadata --no-deps --offline` (workspace et manifestes valides) ;
+- compilation par `rustc` d'un harnais autonome qui reproduit les fonctions
+  patchées avec des types factices : valide le **borrow checker**, l'inférence
+  de types et l'équivalence comportementale avec l'algorithme amont
+  (`scripts/verify_uplink_filters.rs`) ;
+- analyse syntaxique `scripts/check_rust_syntax.py` en repli.
+
+La confirmation définitive (`cargo build -p chirpstack`, `cargo clippy`,
+`make test`) reste à faire sur un poste avec crates.io + les services Docker
+Compose.
 
 ---
 
@@ -79,20 +94,26 @@ amorti.
 
 | Contrôle | Résultat |
 | --- | --- |
-| `diff -ru` contre l'amont, fichiers Rust | 3 fichiers modifiés, patches ciblés |
-| Analyse syntaxique tree-sitter (`uplink/mod.rs`, `uplink/data.rs`, `api/application.rs`) | 0 erreur, identique à l'amont |
-| `cargo build -p chirpstack` / `cargo clippy` | ⏳ à faire sur un poste avec toolchain |
-| `make test` (Postgres + Redis + Mosquitto) | ⏳ à faire : la suite `class_a_test`, `class_a_pr_test`, `otaa_test`, `otaa_pr_test` couvre indirectement les deux filtres |
-| Tests unitaires dédiés aux deux filtres | ⏳ à ajouter (ils nécessitent de construire un `UplinkFrameSet`, donc un `PhyPayload` factice) |
+| `diff -ru` contre l'amont, fichiers Rust | ✅ 3 fichiers modifiés, patches ciblés (cf. §1.1–1.3) |
+| `rustfmt --edition 2024 --check` sur les 3 fichiers | ✅ conformes (identique à l'amont) |
+| `cargo metadata --no-deps --offline` | ✅ workspace valide, 6 crates : `chirpstack`, `backend`, `chirpstack_api`, `lrwn`, `chirpstack_integration`, `lrwn_filters` |
+| `rustc --edition 2024` du harnais `scripts/verify_uplink_filters.rs` | ✅ compile (borrow checker + inférence OK) et **résultats identiques à l'algorithme amont** sur 6 jeux de passerelles + cas d'erreur |
+| Analyse syntaxique tree-sitter (`scripts/check_rust_syntax.py`) | ✅ 0 erreur sur les 3 fichiers |
+| `cargo check -p chirpstack` | ❌ bloqué : `no matching package named 'aes' found` (`--offline`) / timeouts TLS vers `index.crates.io` |
+| `cargo build`, `cargo clippy`, `make test` | ⏳ à faire sur un poste avec crates.io + Docker Compose ; `class_a_test`, `class_a_pr_test`, `otaa_test`, `otaa_pr_test` couvrent indirectement les deux filtres |
+| Tests unitaires in-crate dédiés aux deux filtres | ⏳ à ajouter dès que les dépendances sont disponibles (ils nécessitent un `UplinkFrameSet`, donc un `PhyPayload` factice) |
 
-Script de contrôle statique (utile tant que `cargo` n'est pas disponible) :
+Commandes de vérification reproductibles :
 
 ```bash
-python3 -m venv /tmp/tsvenv
-/tmp/tsvenv/bin/pip install tree-sitter tree-sitter-rust
-/tmp/tsvenv/bin/python scripts/check_rust_syntax.py \
-    chirpstack/src/uplink/mod.rs chirpstack/src/uplink/data.rs \
-    chirpstack/src/api/application.rs
+bash scripts/install-rust-toolchain.sh        # si le toolchain a disparu
+cargo metadata --no-deps --offline
+rustfmt --edition 2024 --config skip_children=true --check \
+  chirpstack/src/uplink/mod.rs chirpstack/src/uplink/data.rs \
+  chirpstack/src/api/application.rs
+rustc --edition 2024 -o /tmp/verify scripts/verify_uplink_filters.rs && /tmp/verify
+python3 -m venv /tmp/tsvenv && /tmp/tsvenv/bin/pip install -q tree-sitter tree-sitter-rust
+/tmp/tsvenv/bin/python scripts/check_rust_syntax.py chirpstack/src/uplink/mod.rs
 ```
 
 ---

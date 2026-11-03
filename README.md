@@ -39,6 +39,7 @@ version amont.
 | `ui/` | Interface web React |
 | `docs/OPTIMIZATIONS.md` | **Audit, modifications appliquées et feuille de route** |
 | `docs/upstream/` | README amont et CI amont archivés |
+| `scripts/` | Installation du toolchain, contrôle syntaxique, harnais de vérification hors ligne |
 
 Le crate serveur représente à lui seul ~88 500 lignes de Rust.
 
@@ -58,12 +59,38 @@ cargo build -p chirpstack # binaire serveur
 Le README amont détaillant ces étapes est conservé dans
 [`docs/upstream/README.md`](docs/upstream/README.md).
 
-> ⚠️ Dans l'environnement de travail actuel, ni `rustc`/`cargo` ni l'accès à
-> `crates.io` ne sont disponibles : la compilation et `make test` ne peuvent pas
-> être exécutés ici. Les modifications sont donc validées statiquement (relecture
-> + analyse syntaxique) et devront être confirmées par `make test` sur un
-> poste disposant de la toolchain. C'est explicitement indiqué pour chaque
-> changement dans `docs/OPTIMIZATIONS.md`.
+### Toolchain Rust dans ce bac à sable
+
+Un toolchain autonome **Rust 1.99.0** (`rustc`, `cargo`, `rust-std`, `rustfmt`,
+`clippy`) est installé et disponible sur le `PATH`. Comme `static.rust-lang.org`,
+`sh.rustup.rs` et `deb.debian.org` sont bloqués ici, l'installation passe par les
+composants officiels Rust repackagés sur `registry.npmjs.org` (hôte autorisé) :
+
+```bash
+bash scripts/install-rust-toolchain.sh     # réinstalle si besoin (~600 Mo, dans ~/.cache)
+cargo --version && rustc --version
+```
+
+> `rust-toolchain.toml` épingle **1.89.0**, mais ce fichier n'est lu que par le
+> proxy `rustup`. Ici on appelle les binaires réels directement, donc l'épingle
+> est ignorée. Sur une machine normale, préférer `rustup toolchain install 1.89.0`.
+
+⚠️ **`crates.io` reste bloqué** (`index.crates.io` / `static.crates.io` inaccessibles) :
+`cargo build`, `cargo check` et `make test` ne peuvent donc pas télécharger les
+~500 dépendances du workspace. Pour compiler réellement, il faut soit un accès
+réseau à crates.io, soit un répertoire `vendor/` produit par `cargo vendor` sur
+une machine connectée.
+
+En attendant, ces vérifications fonctionnent **hors ligne** :
+
+```bash
+cargo metadata --no-deps --offline                     # workspace valide (6 crates)
+rustfmt --edition 2024 --config skip_children=true --check chirpstack/src/uplink/mod.rs
+rustc --edition 2024 -o /tmp/verify scripts/verify_uplink_filters.rs && /tmp/verify
+python3 scripts/check_rust_syntax.py chirpstack/src/uplink/mod.rs
+```
+
+Le détail par modification est dans [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md).
 
 ## Méthode de travail
 
