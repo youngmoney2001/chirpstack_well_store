@@ -86,16 +86,16 @@ cargo check --offline -p chirpstack --no-default-features --features sqlite
 | `cargo clippy --offline -p chirpstack` | ✅ 0 erreur ; warnings préexistants de l'amont uniquement |
 | `cargo test --offline -p chirpstack --no-run` | ✅ binaire de test compilé (3 min 51) |
 | `cargo test --offline -p chirpstack uplink::tests -- --test-threads=1` | ✅ 3/3 tests des filtres d'uplink |
-| `cargo test --offline -p chirpstack codec::js:: -- --test-threads=1` | ✅ 24/24 tests du codec JS (8 amont + 16 pool/sécurité), 3 benchmarks ignorés |
-| `chirpstack --config <DIR> configfile` → parseur TOML | ✅ config générée valide (6 options `[codec.js]`) |
+| `cargo test --offline -p chirpstack codec::js:: -- --test-threads=1` | ✅ 33/33 tests du codec JS (8 amont + 25 pool/sécurité), 3 benchmarks ignorés |
+| `chirpstack --config <DIR> configfile` → parseur TOML | ✅ config générée valide (10 options `[codec.js]`) |
 | Binaire de test : `CARGO_INCREMENTAL=0 cargo test ... --no-run` | ✅ évite le `SIGKILL` du linker par l'OOM du bac à sable (3,8 Gio) |
 
 Les fichiers modifiés par nos optimisations ne produisent **aucun** warning ni
 erreur nouveaux. Les autres tests (`class_a_test`, `otaa_test`, `relay_*`, …)
 compilent mais nécessitent les services Docker Compose pour s'exécuter.
 `chirpstack/Cargo.toml` active en plus la feature Tokio `sync` (déjà présente
-transitivement), utilisée par le sémaphore du pool QuickJS ; `Cargo.lock` n'est
-pas modifié.
+transitivement), utilisée par le canal `oneshot` du pool QuickJS dédié ; `Cargo.lock`
+n'est pas modifié.
 
 ## Limites connues
 
@@ -116,5 +116,13 @@ pas modifié.
   l'OOM (`signal: 9, SIGKILL`). Utiliser
   `CARGO_INCREMENTAL=0 cargo test --offline -j 1 -p chirpstack --no-run` avant
   de lancer les tests ; ce n'est pas une erreur de code.
+- **Build `--release`** : le profil release du workspace active
+  `lto = true` + `codegen-units = 1`. L'édition du binaire de test par `rustc`
+  consomme alors plus de 3,7 Gio et est tuée par l'OOM (`signal: 9`). Pour les
+  benchmarks de production dans ce bac, neutraliser **uniquement le LTO** via
+  `CARGO_PROFILE_RELEASE_LTO=off cargo test --release --offline -j 1 -p
+  chirpstack --no-run` : `opt-level="z"` et `codegen-units=1` sont conservés,
+  aucun fichier `Cargo.toml` n'est modifié. Le binaire de production livré
+  reste compilé avec le profil release complet.
 - **Renouvellement** : après toute modification de `Cargo.lock`, relancer
   `scripts/fetch-vendor-crates.sh --trigger --cleanup`.

@@ -33,7 +33,9 @@ réellement ici** en `--offline`, avec le workspace complet. Pour chaque patch :
   patchées avec des types factices : **borrow checker**, inférence de types et
   équivalence comportementale avec l'algorithme amont
   (`scripts/verify_uplink_filters.rs`) ;
-- analyse syntaxique `scripts/check_rust_syntax.py` en repli.
+- analyse syntaxique `scripts/check_rust_syntax.py` en repli ;
+- benchmarks `--release` (avec `CARGO_PROFILE_RELEASE_LTO=off` dans ce bac à
+  sable, voir `docs/OFFLINE-BUILD.md`).
 
 Seul `make test` reste à faire sur un poste avec les services Docker Compose
 (PostgreSQL, Redis, Mosquitto…). L'UI est un placeholder `ui/build/index.html`
@@ -491,6 +493,232 @@ sans contournement ni `unsafe`.
 - `make test` complet (PostgreSQL / Redis / Mosquitto via Docker Compose)
   reste indisponible dans ce bac à sable.
 
+## Revue A/B/C de `743c680` — appliquée (2026-11-03)
+
+Revue demandée avant d'ouvrir la 2.2 : **deux corrections bloquantes (A, B)** et
+**trois vérifications (C1, C2, C3)**. Aucune piste 2.2 n'a été démarrée. Ce
+journal remplace, pour le codec JS, les paragraphes « Durcissement sécurité de
+la 2.1 » qui décrivaient l'état intermédiaire `743c680`.
+
+### A. Pool dédié de N threads OS — nombre de runtimes borné
+
+`743c680` utilisait `tokio::task::spawn_blocking` + `thread_local!` : un
+`Worker` (donc un `Runtime` QuickJS et jusqu'à 64 realms) était créé **par
+thread de blocking Tokio**. Ce pool est partagé avec le reste de l'application
+et peut monter à 512 threads : le pire cas théorique était
+`512 × 64 × 32 Mio = 1 Tio`, sans borne exploitable.
+
+| Étape | Nombre de threads | Borne mémoire JS |
+| --- | --- | --- |
+| `743c680` | jusqu'à 512 (Tokio, partagé) | `512 × 64 × 32 Mio` = **1 Tio** (non bornée) |
+| A (borne demandée) | `N = workers` | `N × max_memory_bytes` = 2 × 32 Mio = **64 Mio** |
+| B (une entrée = un Runtime, anciens défauts) | `N = workers` | `N × 64 × 32 Mio` = **4 Gio** |
+| **B avec défauts ajustés (livré)** | `N = workers` | `N × 8 × 4 Mio` = **64 Mio** sur ce bac (N=2) |
+
+Implémentation (`chirpstack/src/codec/js/mod.rs`) :
+
+- `CODEC_POOL: LazyLock<CodecPool>` crée exactement **N threads OS dédiés**
+  nommés `chirpstack-js-codec-{i}`, chacun propriétaire d'un unique `Worker`.
+  Plus aucun `spawn_blocking`, plus aucun `thread_local!`, plus de sémaphore.
+- `N = [codec.js] workers`, `0` = `std::thread::available_parallelism()`
+  (**2** dans ce bac à sable). À fixer explicitement sur un hôte très multicœur.
+- File **bornée** `std::sync::mpsc::sync_channel(queue_capacity)`,
+  `queue_capacity = workers × 4` par défaut (**8** ici), partagée via
+  `Arc<Mutex<Receiver>>` ; le verrou n'est tenu que pendant `recv()`, jamais
+  pendant l'exécution JS (sinon les workers se sérialiseraient).
+- Réponse par **`tokio::sync::oneshot`**. `submit()` utilise `try_send()` :
+  file pleine ⇒ `codec_js_queue_full_total` + erreur
+  `JS codec queue is full (...); request rejected`, **sans attente**. Test
+  `a_full_queue_is_rejected_without_waiting`.
+- Nouvelles métriques Prometheus : `codec_js_panics_total`,
+  `codec_js_queue_full_total`.
+
+### B. Un Runtime par entrée de cache — budgets réellement par script
+
+`CachedScript` contient désormais **`Runtime + Context + Persistent`** (et le
+texte du script, l'horloge LRU, le compteur d'appels). Le `Worker` ne possède
+plus de `Runtime` : seulement une `HashMap<CacheKey, CachedScript>` et une
+horloge.
+
+| Propriété | `743c680` | Livré |
+| --- | --- | --- |
+| `set_memory_limit` / `set_max_stack_size` | 1 Runtime partagé par 64 realms | **par script** |
+| `run_gc()` | parcourt les 64 Context | **1 seul realm** |
+| `memory_usage()` et seuil de recyclage | global au worker | **par script** |
+| Éviction de cache | vidait **tout** le cache | **LRU** (`last_used`, une entrée) |
+| Erreur / saturation mémoire | jetait tout le worker | retire **uniquement** le realm fautif |
+
+Conséquence mesurée sur le GC (debug, cache plein, 200 appels). Les deux
+colonnes comparent des caches **pleins aux défauts de leur version** (64 realms
+avant, 8 après) : l'écart inclut donc l'effet combiné de B et du nouveau
+dimensionnement, ce qui est bien l'effet observé en production.
+
+| `gc_every_calls` | `743c680` (64 realms, 1 Runtime) | Livré (8 realms, 8 Runtimes) |
+| --- | --- | --- |
+| `gc=1` | 8,14 – 8,37 **ms**/appel | **0,176 ms**/appel |
+| `gc=100` | 0,097 – 0,118 ms/appel | 0,050 ms/appel |
+| `gc=0` | 0,018 – 0,019 ms/appel | 0,060 ms/appel |
+
+Le GC à chaque appel est redevenu bon marché (≈ ×47 moins cher qu'avant) :
+**`gc_every_calls` repasse de `100` à `1`**. Il reste ~×3 plus lent que
+`gc=0`, mais il supprime la dérive mémoire entre deux appels ; le surcoût
+absolu en release est mesuré au §C3.
+
+**Test d'isolation exigé** :
+`memory_exhaustion_in_one_script_does_not_affect_another_on_the_same_thread`
+charge le realm B, sature la mémoire du realm A sur le **même** worker
+(`JS codec memory limit exceeded: Error: out of memory`), vérifie que le realm
+B est **toujours en cache** et que l'appel suivant sur B renvoie le bon
+résultat. Complété par `each_cache_entry_has_its_own_runtime_and_context`
+(`Context::as_raw()` **et** `get_runtime_ptr()` distincts).
+
+**Recalcul de la borne et ajustement des défauts.** B remplace la borne A par
+`N × max_cached_scripts × max_memory_bytes`. Avec les défauts de `743c680`
+(64 scripts, 32 Mio) et N=2, cette borne passe à **4 Gio** : inacceptable.
+Pour conserver la borne de 64 Mio visée par A, les défauts sont abaissés :
+
+| Option | `743c680` | Livré |
+| --- | --- | --- |
+| `max_cached_scripts` | 64 | **8** |
+| `max_memory_bytes` | 32 Mio | **4 Mio** (4 194 304) |
+| `max_calls_per_worker` | 10 000 | 10 000 |
+| `gc_every_calls` | 100 | **1** |
+| `workers` | — | **0** (= `available_parallelism`) |
+| `queue_capacity` | — | **0** (= `workers × 4`) |
+| `max_script_bytes` | — | **256 Kio** |
+
+**Borne totale livrée** :
+`workers × max_cached_scripts × max_memory_bytes`
+= 2 × 8 × 4 194 304 = **67 108 864 octets = 64 Mio** sur ce bac, plus
+`queue_capacity` messages en attente (ils ne contiennent aucun realm). Mesure
+réelle d'un cache plein sur un thread : **2 298 720 octets** pour 8 realms,
+soit 6,9 % de la borne. Sur un hôte à 32 cœurs, la même configuration donne
+1 Gio : **fixer `[codec.js] workers` explicitement** en production.
+
+### C1. `catch_unwind` en release et `mem::forget`
+
+Vérification : aucun `panic = "abort"` / `panic = "unwind"` dans les fichiers
+TOML du workspace ; `[profile.release]` ne contient que `opt-level = "z"`,
+`lto = true`, `codegen-units = 1`. `rustc --print cfg` donne
+`panic="unwind"`, et le test `catch_unwind_is_effective_in_this_build`
+(`assert!(cfg!(panic = "unwind"))`) est exécuté **dans le binaire `--release`** :
+`catch_unwind` y est donc **opérant**, contrairement à l'hypothèse de la revue.
+Il deviendrait inopérant si un déploiement ajoutait `-C panic=abort` ; c'est
+documenté comme risque résiduel, aucune modification du profil n'a été faite.
+
+Après un panic attrapé, `run_slot` fait `slot.take()` puis
+**`std::mem::forget(worker)`** : aucun `Drop` de `Runtime`, de `Context` ou de
+`Persistent` n'est exécuté (un `abort()` rquickjs sur un état C corrompu est
+ainsi évité), puis `error!(...)`, `CODEC_PANIC_COUNTER.inc()` et une erreur
+propre `JS codec engine aborted (runtimes leaked, worker discarded)`. Le
+`Drop` n'est utilisé que sur le chemin **normal** (recyclage après
+`max_calls_per_worker`), où les runtimes sont connus sains. Test
+`caught_panic_leaks_the_runtimes_and_discards_the_worker`.
+
+> **Écart assumé** : la fuite est réelle et **cumulative**. Chaque panic laisse
+> jusqu'à `max_cached_scripts × max_memory_bytes` (32 Mio ici) de realm
+> QuickJS non libérés ; la borne de 64 Mio ne s'applique donc qu'au pool
+> **vivant**. C'est la conséquence directe de la consigne « ne pas exécuter le
+> Drop » : alerter sur `codec_js_panics_total` (toute valeur > 0 doit déclencher
+> un redémarrage du processus). Aucune correction n'a été tentée ici, car elle
+> contreviendrait à C1.
+
+### C2. Ordre d'armement de la deadline et taille de script
+
+`CachedScript::new()` crée le Runtime, applique les limites et **évalue le
+module vendored** (`buffer` → `ieee754`, `base64-js`) **sans aucun handler
+d'interruption** : c'est du code interne de taille fixe, son coût ne doit pas
+être imputé au budget utilisateur. Ensuite seulement :
+
+```
+CachedScript::new()      -> vendor_loaded      (pas de deadline)
+set_interrupt_handler()  -> deadline_armed    (max_execution_time)
+compile_entry(script)    -> user_compile      (texte contrôlé par l'utilisateur)
+set_interrupt_handler()  -> deadline_refreshed (avant chaque appel, hors ctx.with)
+```
+
+L'armement se fait **hors** `ctx.with()` (qui verrouille le Runtime, sinon
+interblocage). Sur un cache hit, il n'y a pas de compilation : la deadline est
+simplement réarmée avant l'exécution.
+
+Tests : `deadline_order_is_vendor_then_deadline_then_user_script` (trace
+ordonnée), `top_level_infinite_loop_is_interrupted` (une boucle `while(true){}`
+**au niveau module** est bien interrompue : `Error: interrupted` à
+`<anonymous>:1:1`), `oversized_script_is_rejected_before_compilation`.
+
+**Nouvelle limite absente de `743c680`** : `[codec.js] max_script_bytes`
+(défaut 256 Kio), appliquée au script généré (codec utilisateur + wrapper)
+**avant** toute création de Runtime, donc avant même l'armement de la
+deadline. Elle borne le travail du parseur/compilateur.
+
+### C3. Bench en `--release`
+
+Les chiffres de `743c680` étaient des chiffres **debug**, non représentatifs de
+la production. Tous les benchmarks ont été relancés en `--release` (200 appels
+par mesure, 3 runs isolés chacun, `--test-threads=1`) :
+
+| Mesure | `--release` |
+| --- | --- |
+| Pool livré, `gc=1` (défaut) | 30,88 / 30,62 / 33,61 ms → **154,4 / 153,1 / 168,1 µs par appel** |
+| Pool livré, `gc=1` (mesure répétée) | 30,58 / 24,01 / 32,05 ms → 152,9 / 120,1 / 160,2 µs par appel |
+| Pool livré, `gc=0` | 26,50 / 19,05 / 25,21 ms → 132,5 / 95,3 / 126,0 µs par appel |
+| `cache_scripts=false` (comportement amont) | 784,9 / 773,2 / 823,7 ms → **3,92 / 3,87 / 4,12 ms par appel** |
+| Cache miss (Runtime + modules vendored + compilation) | 78,2 / 77,4 / 95,1 ms pour 20 → **3,91 / 3,87 / 4,76 ms, une fois par clé** |
+| GC plein cache (8 realms) : `gc=1` / `gc=100` / `gc=0` | **49,1 – 49,7 / 15,8 – 16,4 / 15,8 – 16,0 µs** par appel |
+| Gain sur appels en cache | ≈ **×23 – ×27** (≈ ×25) vs `cache_scripts=false` du même binaire |
+
+`gc=default` et `gc=1` sont la même configuration (`gc_every_calls=1`),
+mesurée deux fois pour donner l'ordre de grandeur du bruit. Le GC à chaque
+appel coûte ~30 µs de plus que `gc=0` sur le banc interne (49,1 vs 16,0 µs),
+soit un surcoût acceptable de ~25 % sur le chemin complet ; c'est ce qui
+justifie le retour de `gc_every_calls` à `1`. Le bench imprime aussi
+`[release] panic strategy: unwind=true abort=false`, ce qui confirme C1 dans le
+binaire optimisé. Le cache miss est divisé par ~2,4 par rapport aux
+8,5 – 11,6 ms mesurés en debug sur `743c680` (comparaison inter-profils
+indicative).
+
+Reproduire (dans ce bac à sable, voir `docs/OFFLINE-BUILD.md` pour la raison
+des deux overrides de profil) :
+
+```bash
+export CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+cargo test --release --offline -q -j 1 -p chirpstack codec::js::bench::bench_decode \
+  -- --ignored --nocapture --test-threads=1
+cargo test --release --offline -q -j 1 -p chirpstack codec::js::bench::bench_cache_miss \
+  -- --ignored --nocapture --test-threads=1
+cargo test --release --offline -q -j 1 -p chirpstack \
+  codec::js::pool_test::bench_gc_with_a_full_cache -- --ignored --nocapture --test-threads=1
+```
+
+### Écarts avec les consignes A/B/C
+
+| # | Consigne | Écart / réconciliation |
+| --- | --- | --- |
+| 1 | A demande de documenter `N × max_memory_bytes`. | B la remplace par `N × max_cached_scripts × max_memory_bytes` dès lors qu'un Runtime est créé par script. Les deux bornes sont documentées ci-dessus ; les défauts ont été abaissés (8 × 4 Mio) pour que la **borne finale reste 64 Mio**, identique à celle visée par A. Ce n'est pas un choix silencieux. |
+| 2 | A : « canal borné ». | `std::sync::mpsc::sync_channel` + `Arc<Mutex<Receiver>>` (bibliothèque standard) au lieu d'un `crossbeam-channel`/`flume` : **aucune dépendance ajoutée**, `Cargo.lock` inchangé. Le verrou n'est tenu que pendant `recv()`. La capacité ne compte que les messages **en attente** ; le nombre total de travaux en vol est `N + queue_capacity`. |
+| 3 | A : `workers` par défaut = `available_parallelism`. | Confirmé (2 ici). `queue_capacity` par défaut = `workers × 4`, `max_script_bytes` = 256 Kio : valeurs choisies ici, non imposées par la revue. |
+| 4 | B : LRU bornée par `max_cached_scripts` par thread. | Implémentée par une horloge monotone `last_used` + `evict_lru()` (une seule entrée par insertion). `743c680` vidait tout le cache. |
+| 5 | C1 : vérifier `panic="abort"`. | **Aucun `panic="abort"` n'est configuré** : release = `panic="unwind"`, `catch_unwind` reste opérant. La consigne « le documenter comme inopérant » ne s'applique donc pas ; le risque si un déploiement force `panic=abort` est documenté. `mem::forget` + log + métrique sont appliqués, avec la fuite cumulative signalée. |
+| 6 | C2 : deadline après modules vendored, avant compilation. | Conforme. Ajout de `max_script_bytes`, mais la deadline ne couvre **pas** le chargement vendored (coût interne, volontairement exclu du budget utilisateur). |
+| 7 | C3 : benchs en `--release`. | Conforme : benchs compilés et exécutés avec `--release` (`opt-level="z"`), **33/33 tests passent aussi dans le binaire release**. Écart d'environnement : le profil release exact du workspace (`lto=true`, `codegen-units=1`) fait dépasser 3,7 Gio au `rustc` final dans ce bac à ~3,9 Gio et il est tué par l'OOM (`signal: 9`). Les chiffres viennent donc de `CARGO_PROFILE_RELEASE_LTO=off` + `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` : optimisés, mais pas ceux du binaire LTO livré (un peu plus rapide). Aucun `Cargo.toml` modifié ; sur un poste avec plus de RAM, relancer sans ces deux variables. |
+| 8 | Tests déterministes du panic. | Un champ `panic_probe: bool` (toujours `false` en production) a été ajouté à `Job` pour déclencher un panic de façon reproductible sans affecter les autres threads du pool. Crochet de test dans le type de production : à supprimer si l'on introduit un mécanisme d'injection dédié. |
+| 9 | `VendorLoader` (`743c680`). | Conservé bien qu'un Runtime par script rende le loader `BuiltinLoader` à usage unique inoffensif : il évite de réintroduire le piège si un Runtime venait à héberger plusieurs Context. |
+
+### Validation
+
+- `rustfmt --check`, `cargo clippy --offline -p chirpstack` : 0 erreur, 0
+  warning nouveau.
+- `cargo check --offline -p chirpstack` (postgres) et `--tests` : OK ;
+  `cargo check --no-default-features --features sqlite` : `OK en 52 s, 0 erreur`.
+- `cargo test --offline -p chirpstack codec::js:: -- --test-threads=1` :
+  **33 passés / 0 échec / 3 ignorés** (8 tests amont + 25 tests pool/sécurité,
+  3 benchmarks manuels ignorés), 1,07 s.
+- `chirpstack --config <DIR> configfile` : TOML valide, **10 options
+  `[codec.js]`** rendues.
+- `uplink::tests` : 3/3.
+- `make test` complet (PostgreSQL / Redis / Mosquitto) toujours indisponible
+  dans ce bac à sable.
+
 ---
 
 ## Cartographie du chemin chaud
@@ -525,7 +753,7 @@ gateway backend (MQTT / UDP)
 
 | # | Piste | Fichier(s) | Impact attendu | Effort / risque |
 | --- | --- | --- | --- | --- |
-| 2.1 | ✅ **Appliquée + durcie** — pool de runtimes QuickJS, cache de scripts compilés, puis isolation par `Context`/tenant/profil, limites mémoire/stack, GC et recyclage (24 tests). Voir « Phase 2.1 » et « Durcissement sécurité de la 2.1 ». | `chirpstack/src/codec/js/mod.rs`, `codec/mod.rs`, `config.rs`, `cmd/configfile.rs`, 3 appelants | **Élevé**, ~×33–42 sur appels en cache | Fait |
+| 2.1 | ✅ **Appliquée + durcie** — pool de runtimes QuickJS, cache de scripts compilés, puis isolation par `Context`/tenant/profil, limites mémoire/stack, GC et recyclage, puis revue A/B/C : pool dédié de N threads, un Runtime par script, LRU, `mem::forget` sur panic, `max_script_bytes`, benchs `--release` (33 tests). Voir « Phase 2.1 », « Durcissement sécurité de la 2.1 » et « Revue A/B/C de 743c680 ». | `chirpstack/src/codec/js/mod.rs`, `codec/mod.rs`, `config.rs`, `cmd/configfile.rs`, 3 appelants | **Élevé**, ~×33–42 sur appels en cache | Fait |
 | 2.2 | Éviter `sessions.push(ds.clone())` pour chaque device candidat lors de la validation MIC : travailler par référence et ne cloner la session que sur succès. | `chirpstack/src/storage/device.rs` (~l. 347) | Moyen, proportionnel au nombre de devices partageant un DevAddr | Moyen |
 | 2.3 | Réduire les allers-retours Redis de la déduplication / du verrou Class-A (regrouper en pipeline ou Lua). | `chirpstack/src/uplink/mod.rs`, `chirpstack/src/downlink/scheduler.rs` | Moyen sur réseau dense | Moyen / risque de régression sur la concurrence |
 | 2.4 | Ajouter des métriques de latence par étape du pipeline d'uplink (histogrammes Prometheus) pour mesurer avant/après au lieu d'estimer. | `chirpstack/src/monitoring/` | Indispensable pour valider 2.1–2.3 | Faible |

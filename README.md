@@ -105,38 +105,55 @@ Le détail des modifications du noyau est dans
   suppression d'un appel dupliqué à `set_region_config()`, regex IFTTT compilée
   une seule fois.
 - **Phase 2.1** : le codec JavaScript ne crée plus un runtime QuickJS par trame.
-  Un pool de runtimes par thread de blocking Tokio + un cache de scripts
-  compilés fait passer le micro-benchmark de ~8,9 ms à ~0,25 ms par décodage
-  (≈ ×35 sur les appels en cache).
-- **Durcissement 2.1 (sécurité)** : un `Context` JS dédié **par entrée de cache**
-  (clé = tenant + device profile + hash du script), limites mémoire/stack par
-  runtime, GC périodique, recyclage des workers, et erreurs propres sur OOM /
+  Un **pool dédié de N threads OS** + un cache de scripts compilés (un
+  `Runtime + Context` par script, LRU bornée) fait passer le micro-benchmark
+  `--release` d'environ 3,9 ms (realm neuf par appel) à ~0,15 ms par décodage,
+  soit ≈ ×25 (voir les chiffres dans
+  [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md)).
+- **Durcissement 2.1 (sécurité)** : clé de cache = tenant + device profile +
+  hash du script (avec comparaison du texte complet), isolation des realms,
+  limites mémoire/stack, GC, recyclage des workers, erreurs propres sur OOM /
   débordement de pile. Un codec qui modifie `Object.prototype` ou `JSON.parse`
   ne peut plus affecter un autre profil ou un autre tenant.
+- **Revue A/B/C de la 2.1 (sécurité)** : fin du `spawn_blocking` +
+  `thread_local!` (qui pouvait créer jusqu'à 512 workers) au profit de N threads
+  dédiés alimentés par une **file bornée** (`try_send` ⇒ erreur propre si
+  pleine, jamais d'attente) ; les limites mémoire/stack/GC/`memory_usage`
+  deviennent **réellement par script** ; après un panic attrapé, `mem::forget`
+  + log + métrique `codec_js_panics_total` au lieu du `Drop` d'un runtime
+  potentiellement corrompu ; deadline armée **après** les modules vendored et
+  **avant** la compilation du script utilisateur ; ajout de `max_script_bytes`;
+  benchmarks refaits en `--release`.
+
+**Borne mémoire totale du codec JS** :
+`workers × max_cached_scripts × max_memory_bytes` = 2 × 8 × 4 Mio =
+**64 Mio** avec les valeurs par défaut sur ce bac à sable (2 cœurs). Sur un
+hôte très multicœur, **fixer `workers` explicitement**.
 
 Options `[codec.js]` (facultatives, valeurs par défaut indiquées) :
 
 ```toml
 [codec.js]
 max_execution_time="100ms"
-cache_scripts=true        # false = comportement amont (runtime neuf par appel)
-max_cached_scripts=64     # scripts compilés (realms) conservés par worker
-max_memory_bytes=33554432 # limite QuickJS par runtime (0 = illimité)
+cache_scripts=true        # false = comportement amont (realm neuf par appel)
+max_cached_scripts=8      # realms (Runtime + Context) conservés par thread
+workers=0                 # 0 = available_parallelism()
+queue_capacity=0          # 0 = workers * 4 ; file pleine = erreur propre
+max_script_bytes=262144   # taille max du script généré (wrapper inclus)
+max_memory_bytes=4194304  # limite QuickJS PAR SCRIPT (0 = illimité)
 max_stack_bytes=524288
 max_calls_per_worker=10000
-gc_every_calls=100        # 1 = GC à chaque appel (coûteux), 0 = désactivé
+gc_every_calls=1          # 1 realm par Runtime : le GC à chaque appel est bon marché
 ```
 
 `cache_scripts=false` est à utiliser si un codec s'appuie sur la remise à zéro
-de variables déclarées hors de `decodeUplink` / `encodeDownlink`. Attention :
-`max_memory_bytes` et `max_stack_bytes` sont des limites **par Runtime**, donc
-partagées par tous les `Context` d'un même worker (limitation QuickJS 0.14,
-voir [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md)).
+de variables déclarées hors de `decodeUplink` / `encodeDownlink`.
 
 Tests rapides :
 
 ```bash
 cargo test --offline -p chirpstack codec::js:: -- --test-threads=1
+# benchmarks (ajouter --release pour des chiffres de production) :
 cargo test --offline -p chirpstack codec::js::bench -- --ignored --nocapture --test-threads=1
 ```
 

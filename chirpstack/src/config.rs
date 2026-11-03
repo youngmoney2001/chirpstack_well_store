@@ -448,13 +448,23 @@ pub struct CodecJs {
     /// upstream-equivalent realm-per-call deployment.
     pub cache_scripts: bool,
     /// Maximum number of compiled scripts (and therefore JS realms) cached
-    /// per worker.
+    /// per dedicated worker thread. This is a true LRU bound.
     pub max_cached_scripts: usize,
-    /// Hard QuickJS memory limit per runtime. 0 = unlimited (not recommended).
-    /// NOTE: QuickJS applies this per JSRuntime, so it is shared by all
-    /// contexts of a pooled worker.
+    /// Number of dedicated OS threads running JS codecs. 0 = auto
+    /// (std::thread::available_parallelism()). Set it explicitly on hosts with
+    /// many cores: total JS memory is
+    /// workers * max_cached_scripts * max_memory_bytes.
+    pub workers: usize,
+    /// Maximum number of jobs waiting for a worker. 0 = auto (workers * 4).
+    /// A full queue rejects the job with a clean error instead of waiting.
+    pub queue_capacity: usize,
+    /// Maximum size of the generated script (user codec + wrapper) in bytes.
+    /// Bounds parser/compiler work before any interrupt deadline is armed.
+    pub max_script_bytes: usize,
+    /// Hard QuickJS memory limit PER SCRIPT (one Runtime per cache entry).
+    /// 0 = unlimited (not recommended).
     pub max_memory_bytes: usize,
-    /// Maximum JS stack size per runtime.
+    /// Maximum JS stack size for each script's runtime.
     pub max_stack_bytes: usize,
     /// Recycle a pooled worker after this many calls, so long-lived state
     /// (atoms, shapes, cyclic garbage, tampered intrinsics) cannot accumulate.
@@ -468,15 +478,17 @@ impl Default for CodecJs {
         CodecJs {
             max_execution_time: Duration::from_millis(100),
             cache_scripts: true,
-            max_cached_scripts: 64,
-            max_memory_bytes: 32 * 1024 * 1024,
+            // Bound: workers * 8 * 4 MiB = 32 MiB per worker thread.
+            max_cached_scripts: 8,
+            workers: 0,
+            queue_capacity: 0,
+            max_script_bytes: 256 * 1024,
+            max_memory_bytes: 4 * 1024 * 1024,
             max_stack_bytes: 512 * 1024,
             max_calls_per_worker: 10_000,
-            // JS_RunGC walks EVERY context of the runtime. Measured with a
-            // full 64-context cache: gc=1 => 8.1-8.4 ms/call, gc=100 =>
-            // 0.10-0.12 ms/call, gc=0 => 0.018 ms/call. See
-            // docs/OPTIMIZATIONS.md, section "Durcissement securite de la 2.1".
-            gc_every_calls: 100,
+            // Each script now owns its own Runtime+Context, so JS_RunGC walks a
+            // single realm and is cheap again. See docs/OPTIMIZATIONS.md.
+            gc_every_calls: 1,
         }
     }
 }
