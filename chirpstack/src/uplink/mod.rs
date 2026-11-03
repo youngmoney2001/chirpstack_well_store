@@ -420,29 +420,35 @@ async fn update_gateway_metadata(ufs: &mut UplinkFrameSet) -> Result<()> {
 
 fn filter_rx_info_by_tenant_id(tenant_id: Uuid, uplink: &mut UplinkFrameSet) -> Result<()> {
     let force_gws_private = config::get_force_gws_private(&uplink.region_config_id)?;
-    let mut rx_info_set: Vec<gw::UplinkRxInfo> = Vec::new();
 
-    for rx_info in &uplink.rx_info_set {
-        let gateway_id = EUI64::from_str(&rx_info.gateway_id).context("Gateway ID")?;
+    // Resolve everything that can fail before modifying rx_info_set, so that a
+    // malformed gateway id leaves the original set untouched (as before).
+    // Filtering in place avoids cloning every UplinkRxInfo into a second Vec:
+    // on a busy network this removes one deep protobuf clone per receiving
+    // gateway, for every uplink.
+    let gateway_ids: Vec<EUI64> = uplink
+        .rx_info_set
+        .iter()
+        .map(|rx_info| EUI64::from_str(&rx_info.gateway_id).context("Gateway ID"))
+        .collect::<Result<_>>()?;
 
-        if !(uplink
-            .gateway_private_up_map
-            .get(&gateway_id)
-            .cloned()
-            .unwrap_or(true)
-            || force_gws_private)
-            || uplink
-                .gateway_tenant_id_map
+    let private_up_map = &uplink.gateway_private_up_map;
+    let tenant_id_map = &uplink.gateway_tenant_id_map;
+
+    let mut i = 0;
+    uplink.rx_info_set.retain(|_| {
+        let gateway_id = gateway_ids[i];
+        i += 1;
+
+        // A gateway without a tenant_id must never match. A freshly generated
+        // random UUID was used for this before; checking the Option directly
+        // removes one RNG call per gateway and makes the behaviour deterministic.
+        !(private_up_map.get(&gateway_id).copied().unwrap_or(true) || force_gws_private)
+            || tenant_id_map
                 .get(&gateway_id)
-                .cloned()
-                .unwrap_or_else(Uuid::new_v4)
-                == tenant_id
-        {
-            rx_info_set.push(rx_info.clone());
-        }
-    }
+                .is_some_and(|v| *v == tenant_id)
+    });
 
-    uplink.rx_info_set = rx_info_set;
     if uplink.rx_info_set.is_empty() {
         return Err(anyhow!("RxInfo set is empty after applying filters"));
     }
@@ -451,20 +457,28 @@ fn filter_rx_info_by_tenant_id(tenant_id: Uuid, uplink: &mut UplinkFrameSet) -> 
 }
 
 fn filter_rx_info_by_public_only(uplink: &mut UplinkFrameSet) -> Result<()> {
-    let mut rx_info_set: Vec<gw::UplinkRxInfo> = Vec::new();
+    // Same approach as above: pre-resolve ids + flags so errors are returned
+    // before any mutation, then compact the Vec in place (no protobuf clones).
+    let private_up_map = &uplink.gateway_private_up_map;
+    let keep: Vec<bool> = uplink
+        .rx_info_set
+        .iter()
+        .map(|rx_info| {
+            let gateway_id = EUI64::from_str(&rx_info.gateway_id).context("Gateway ID")?;
+            let private = *private_up_map
+                .get(&gateway_id)
+                .ok_or_else(|| anyhow!("gateway_id missing in gateway_private_up_map"))?;
+            Ok(!private)
+        })
+        .collect::<Result<_>>()?;
 
-    for rx_info in &uplink.rx_info_set {
-        let gateway_id = EUI64::from_str(&rx_info.gateway_id).context("Gateway ID")?;
-        if !(*uplink
-            .gateway_private_up_map
-            .get(&gateway_id)
-            .ok_or_else(|| anyhow!("gateway_id missing in gateway_private_up_map"))?)
-        {
-            rx_info_set.push(rx_info.clone());
-        }
-    }
+    let mut i = 0;
+    uplink.rx_info_set.retain(|_| {
+        let keep_item = keep[i];
+        i += 1;
+        keep_item
+    });
 
-    uplink.rx_info_set = rx_info_set;
     if uplink.rx_info_set.is_empty() {
         return Err(anyhow!("rx_info_set is empty"));
     }

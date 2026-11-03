@@ -1,8 +1,10 @@
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use chirpstack_api::api;
 use chirpstack_api::api::application_service_server::ApplicationService;
 use chirpstack_api::tonic::{self, Request, Response, Status};
+use regex::Regex;
 use uuid::Uuid;
 
 use super::auth::validator;
@@ -11,6 +13,11 @@ use super::helpers;
 use crate::api::auth::AuthID;
 use crate::certificate;
 use crate::storage::{application, fields};
+
+// Compiled once instead of on every create_ifttt_integration request (same
+// pattern as storage::search::SEARCH_TAG_RE).
+static IFTTT_EVENT_PREFIX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9]+$").unwrap());
 
 pub struct Application {
     validator: validator::RequestValidator,
@@ -1506,9 +1513,7 @@ impl ApplicationService for Application {
             .await?;
 
         if !req_int.event_prefix.is_empty()
-            && !regex::Regex::new(r"^[a-zA-Z0-9]+$")
-                .unwrap()
-                .is_match(&req_int.event_prefix)
+            && !IFTTT_EVENT_PREFIX_RE.is_match(&req_int.event_prefix)
         {
             return Err(Status::invalid_argument(
                 "event_prefix may only contain A-Z, a-z and 0-9 characters",

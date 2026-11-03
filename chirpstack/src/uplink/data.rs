@@ -106,6 +106,8 @@ impl Data {
         ctx.handle_passive_roaming_device().await?;
         ctx.get_device_for_phy_payload().await?;
         ctx.get_device_data().await?;
+        // Resolved once for the whole uplink flow: this caches the Region trait
+        // object in ctx.region_conf and stamps region_config_id on the session.
         ctx.set_region_config()?;
         ctx.check_roaming_allowed()?;
 
@@ -119,7 +121,9 @@ impl Data {
             ctx.filter_rx_info_by_tenant().await?;
         }
         ctx.set_device_info()?;
-        ctx.set_region_config()?;
+        // No second set_region_config() here: filtering rx_info by tenant and
+        // set_device_info do not change the region config, so the call was pure
+        // duplicate work (a String clone + RwLock read + Arc clone per uplink).
         if !ctx._is_roaming() {
             ctx.set_device_gateway_rx_info()?;
         }
