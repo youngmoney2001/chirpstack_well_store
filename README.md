@@ -117,18 +117,27 @@ Le détail des modifications du noyau est dans
   ne peut plus affecter un autre profil ou un autre tenant.
 - **Revue A/B/C de la 2.1 (sécurité)** : fin du `spawn_blocking` +
   `thread_local!` (qui pouvait créer jusqu'à 512 workers) au profit de N threads
-  dédiés alimentés par une **file bornée** (`try_send` ⇒ erreur propre si
-  pleine, jamais d'attente) ; les limites mémoire/stack/GC/`memory_usage`
+  dédiés alimentés par une **file bornée** (attente bornée, rejet seulement en
+  vraie saturation) ; les limites mémoire/stack/GC/`memory_usage`
   deviennent **réellement par script** ; après un panic attrapé, `mem::forget`
   + log + métrique `codec_js_panics_total` au lieu du `Drop` d'un runtime
   potentiellement corrompu ; deadline armée **après** les modules vendored et
   **avant** la compilation du script utilisateur ; ajout de `max_script_bytes`;
   benchmarks refaits en `--release`.
 
+- **Ajustements de la revue (sécurité)** : routage `hash(clé) % N` (un canal
+  par thread, un script compilé **une seule fois**), **éviction sur budget
+  mémoire réel** par thread, `max_cached_scripts` relevé à 64, métriques
+  hits/misses/évictions, et **attente bornée** (`queue_wait_timeout="1s"`)
+  au lieu du rejet immédiat. Un panic attrapé ne tue pas le thread. Voir
+  [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) pour le devenir exact d'un
+  uplink dont le décodage échoue.
+
 **Borne mémoire totale du codec JS** :
-`workers × max_cached_scripts × max_memory_bytes` = 2 × 8 × 4 Mio =
-**64 Mio** avec les valeurs par défaut sur ce bac à sable (2 cœurs). Sur un
-hôte très multicœur, **fixer `workers` explicitement**.
+`workers × max_cache_memory_bytes` = 2 × 32 Mio = **64 Mio** avec les valeurs
+par défaut sur ce bac à sable (2 cœurs). Chaque script reste plafonné à
+`max_memory_bytes` (4 Mio) et chaque thread à 64 realms. Sur un hôte très
+multicœur, **fixer `workers` explicitement**.
 
 Options `[codec.js]` (facultatives, valeurs par défaut indiquées) :
 
@@ -136,14 +145,16 @@ Options `[codec.js]` (facultatives, valeurs par défaut indiquées) :
 [codec.js]
 max_execution_time="100ms"
 cache_scripts=true        # false = comportement amont (realm neuf par appel)
-max_cached_scripts=8      # realms (Runtime + Context) conservés par thread
-workers=0                 # 0 = available_parallelism()
-queue_capacity=0          # 0 = workers * 4 ; file pleine = erreur propre
-max_script_bytes=262144   # taille max du script généré (wrapper inclus)
-max_memory_bytes=4194304  # limite QuickJS PAR SCRIPT (0 = illimité)
+max_cached_scripts=64       # realms max par thread (LRU)
+workers=0                   # 0 = available_parallelism()
+queue_capacity=0            # 0 = 256 PAR thread (total = N * 256)
+queue_wait_timeout="1s"     # attente bornée ; rejet seulement en saturation réelle
+max_script_bytes=262144     # taille max du script généré (wrapper inclus)
+max_cache_memory_bytes=33554432  # budget réel PAR thread (somme memory_usage)
+max_memory_bytes=4194304    # limite QuickJS PAR SCRIPT (0 = illimité)
 max_stack_bytes=524288
 max_calls_per_worker=10000
-gc_every_calls=1          # 1 realm par Runtime : le GC à chaque appel est bon marché
+gc_every_calls=1            # 1 realm par Runtime : le GC à chaque appel est bon marché
 ```
 
 `cache_scripts=false` est à utiliser si un codec s'appuie sur la remise à zéro
@@ -156,6 +167,14 @@ cargo test --offline -p chirpstack codec::js:: -- --test-threads=1
 # benchmarks (ajouter --release pour des chiffres de production) :
 cargo test --offline -p chirpstack codec::js::bench -- --ignored --nocapture --test-threads=1
 ```
+
+## Piste 2.2 — reconnaissance sécurité (étape 1)
+
+Le rapport de reconnaissance, **sans aucune modification de code**, est dans
+[`docs/SECURITY-2.2-RECON.md`](docs/SECURITY-2.2-RECON.md) : chaîne de
+résolution d'un uplink, modèle de menace (DoS sur DevAddr, rejeu / FCnt,
+concurrence, MIC en temps constant), mesures du coût MIC par nombre de
+candidats et propositions classées. L'implémentation reste à valider.
 
 ## Méthode de travail
 

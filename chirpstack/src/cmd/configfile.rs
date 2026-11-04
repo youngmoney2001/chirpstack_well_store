@@ -660,19 +660,27 @@ pub fn run() {
     # per call).
     cache_scripts={{ codec.js.cache_scripts }}
 
-    # Compiled JS realms kept per worker thread (true LRU bound).
-    # Total JS memory <= workers * max_cached_scripts * max_memory_bytes.
+    # Compiled JS realms kept per worker thread (LRU bound).
+    # Total JS memory <= workers * max_cache_memory_bytes.
     max_cached_scripts={{ codec.js.max_cached_scripts }}
 
     # Dedicated OS threads for JS codecs. 0 = available_parallelism().
     # Set explicitly on high-core hosts to cap the memory bound above.
     workers={{ codec.js.workers }}
 
-    # Max queued jobs. 0 = workers * 4. A full queue rejects with an error.
+    # Capacity of EACH per-thread queue. 0 = 256.
+    # Total queued jobs = workers * queue_capacity.
     queue_capacity={{ codec.js.queue_capacity }}
+
+    # Bounded wait before rejecting a job (real saturation only).
+    queue_wait_timeout="{{ codec.js.queue_wait_timeout }}"
 
     # Max size of the generated script, in bytes (bounds parser work).
     max_script_bytes={{ codec.js.max_script_bytes }}
+
+    # Real per-thread budget: sum of QuickJS memory_usage() over cached realms.
+    # LRU realms are evicted until the sum fits. 0 = disabled.
+    max_cache_memory_bytes={{ codec.js.max_cache_memory_bytes }}
 
     # Hard QuickJS memory limit PER SCRIPT (0 = unlimited).
     max_memory_bytes={{ codec.js.max_memory_bytes }}

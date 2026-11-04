@@ -1,13 +1,17 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, LazyLock, Mutex, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use rquickjs::{CatchResultExt, Function, IntoJs, Persistent};
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::time::timeout;
 use tracing::error;
 use uuid::Uuid;
 
@@ -42,16 +46,71 @@ static CODEC_QUEUE_FULL_COUNTER: LazyLock<Counter> = LazyLock::new(|| {
     counter
 });
 
-/// A FIXED number of dedicated OS threads, each owning exactly one Worker.
-/// This replaces `spawn_blocking` + `thread_local!`: Tokio's blocking pool can
-/// grow to 512 threads shared with the rest of the app, which made the number
-/// of live QuickJS runtimes (and therefore the memory bound) unbounded.
+/// Cache hits / misses on the per-thread LRU.
+static CODEC_CACHE_HITS: LazyLock<Counter> = LazyLock::new(|| {
+    let counter = Counter::default();
+    prometheus::register(
+        "codec_js_cache_hits_total",
+        "Number of JS codec calls served by a cached realm",
+        counter.clone(),
+    );
+    counter
+});
+
+static CODEC_CACHE_MISSES: LazyLock<Counter> = LazyLock::new(|| {
+    let counter = Counter::default();
+    prometheus::register(
+        "codec_js_cache_misses_total",
+        "Number of JS codec calls requiring a new realm (Runtime + modules + compile)",
+        counter.clone(),
+    );
+    counter
+});
+
+/// Evictions, labelled by reason: lru / budget / error.
+static CODEC_CACHE_EVICTIONS: LazyLock<Family<Labels, Counter>> = LazyLock::new(|| {
+    let family = Family::default();
+    prometheus::register(
+        "codec_js_cache_evictions_total",
+        "Number of JS codec realms evicted, by reason (lru / budget / error)",
+        family.clone(),
+    );
+    family
+});
+
+/// Routing observability: detects a hot profile concentrating load on one
+/// dedicated thread (hash(key) % N is deterministic, not load-aware).
+static CODEC_JOBS_BY_WORKER: LazyLock<Family<Labels, Counter>> = LazyLock::new(|| {
+    let family = Family::default();
+    prometheus::register(
+        "codec_js_jobs_by_worker_total",
+        "Number of JS codec jobs handled by each dedicated worker thread",
+        family.clone(),
+    );
+    family
+});
+
+/// A FIXED number of dedicated OS threads, each owning exactly one Worker and
+/// ONE bounded channel. Jobs are routed by hash(tenant, profile, script) % N so
+/// that a given script is compiled and cached exactly once in the process.
 ///
 /// Hard bounds:
 ///   threads        = `codec.js.workers` (default available_parallelism)
-///   waiting jobs   = `codec.js.queue_capacity` (default workers * 4)
-///   JS memory      <= workers * max_cached_scripts * max_memory_bytes
+///   waiting jobs   = N * `codec.js.queue_capacity` (default 256 per thread)
+///   JS memory      <= N * `codec.js.max_cache_memory_bytes`
+///                  (each realm also capped by `max_memory_bytes`,
+///                   and at most `max_cached_scripts` realms per thread)
 static CODEC_POOL: LazyLock<CodecPool> = LazyLock::new(CodecPool::new);
+
+type Labels = Vec<(String, String)>;
+
+fn reason_labels(reason: &str) -> Labels {
+    vec![("reason".to_owned(), reason.to_owned())]
+}
+
+fn worker_labels(worker: usize) -> Labels {
+    vec![("worker".to_owned(), worker.to_string())]
+}
 
 struct JobMessage {
     job: Job,
@@ -60,12 +119,16 @@ struct JobMessage {
 }
 
 struct CodecPool {
-    tx: mpsc::SyncSender<JobMessage>,
-    /// Kept alive so the channel never reports "disconnected" while the pool
-    /// exists; the worker threads share it through an Arc<Mutex<..>>.
-    rx: Arc<Mutex<mpsc::Receiver<JobMessage>>>,
+    /// ONE bounded channel per worker thread; no shared mutex on the receive
+    /// side, so workers never serialise on channel access.
+    senders: Vec<Sender<JobMessage>>,
+    /// Lightweight per-thread job counters used by the routing tests and the
+    /// imbalance benchmark (also exported as a Prometheus metric).
+    jobs_per_worker: Vec<Arc<AtomicU64>>,
     workers: usize,
+    /// Capacity of EACH per-thread channel; total queued = N * queue_capacity.
     queue_capacity: usize,
+    queue_wait_timeout: Duration,
 }
 
 impl CodecPool {
@@ -80,28 +143,53 @@ impl CodecPool {
         }
         .max(1);
         let queue_capacity = if conf.codec.js.queue_capacity == 0 {
-            workers.saturating_mul(4).max(4)
+            256
         } else {
             conf.codec.js.queue_capacity.max(1)
         };
+        CodecPool::start(workers, queue_capacity, conf.codec.js.queue_wait_timeout)
+    }
 
-        let (tx, rx) = mpsc::sync_channel::<JobMessage>(queue_capacity);
-        let pool = CodecPool {
-            tx,
-            rx: Arc::new(Mutex::new(rx)),
-            workers,
-            queue_capacity,
-        };
-        pool.spawn_workers();
+    /// Build N channels. `start` moves the receivers into the dedicated OS
+    /// threads; tests can keep them alive instead to simulate a full queue.
+    fn channels(
+        workers: usize,
+        queue_capacity: usize,
+        queue_wait_timeout: Duration,
+    ) -> (Self, Vec<Receiver<JobMessage>>) {
+        let mut senders = Vec::with_capacity(workers);
+        let mut receivers = Vec::with_capacity(workers);
+        let mut jobs_per_worker = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let (tx, rx) = tokio::sync::mpsc::channel(queue_capacity.max(1));
+            senders.push(tx);
+            receivers.push(rx);
+            jobs_per_worker.push(Arc::new(AtomicU64::new(0)));
+        }
+        (
+            CodecPool {
+                senders,
+                jobs_per_worker,
+                workers,
+                queue_capacity,
+                queue_wait_timeout,
+            },
+            receivers,
+        )
+    }
+
+    fn start(workers: usize, queue_capacity: usize, queue_wait_timeout: Duration) -> Self {
+        let (pool, receivers) = CodecPool::channels(workers, queue_capacity, queue_wait_timeout);
+        pool.spawn_threads(receivers);
         pool
     }
 
-    fn spawn_workers(&self) {
-        for i in 0..self.workers {
-            let rx = Arc::clone(&self.rx);
+    fn spawn_threads(&self, receivers: Vec<Receiver<JobMessage>>) {
+        for (i, rx) in receivers.into_iter().enumerate() {
+            let counter = Arc::clone(&self.jobs_per_worker[i]);
             if let Err(e) = std::thread::Builder::new()
                 .name(format!("chirpstack-js-codec-{i}"))
-                .spawn(move || codec_thread(rx))
+                .spawn(move || codec_thread(i, rx, counter))
             {
                 error!(error = %e, "Unable to start a JS codec worker thread");
             }
@@ -109,22 +197,18 @@ impl CodecPool {
     }
 }
 
-fn codec_thread(rx: Arc<Mutex<mpsc::Receiver<JobMessage>>>) {
+fn codec_thread(index: usize, mut rx: Receiver<JobMessage>, jobs: Arc<AtomicU64>) {
     // ONE Worker per OS thread: its LRU holds one Runtime+Context per script.
     let mut slot: Option<Worker> = None;
     loop {
-        // The receiver lock is held ONLY while waiting for a message. It is
-        // released before any JS work, otherwise workers would serialise.
-        let message = {
-            let guard = match rx.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            match guard.recv() {
-                Ok(m) => m,
-                Err(_) => break,
-            }
+        // A dedicated OS thread, never an async context: blocking_recv is safe.
+        let Some(message) = rx.blocking_recv() else {
+            break;
         };
+        jobs.fetch_add(1, Ordering::Relaxed);
+        CODEC_JOBS_BY_WORKER
+            .get_or_create(&worker_labels(index))
+            .inc();
 
         let JobMessage {
             job,
@@ -144,6 +228,8 @@ struct JsSettings {
     cache_scripts: bool,
     max_cached_scripts: usize,
     max_script_bytes: usize,
+    /// Real per-thread budget: sum of `memory_usage()` over cached realms.
+    max_cache_memory_bytes: usize,
     max_memory_bytes: usize,
     max_stack_bytes: usize,
     max_calls_per_worker: u64,
@@ -159,6 +245,7 @@ impl JsSettings {
             cache_scripts: js.cache_scripts,
             max_cached_scripts: js.max_cached_scripts.max(1),
             max_script_bytes: js.max_script_bytes.max(1),
+            max_cache_memory_bytes: js.max_cache_memory_bytes,
             max_memory_bytes: js.max_memory_bytes,
             max_stack_bytes: js.max_stack_bytes,
             max_calls_per_worker: js.max_calls_per_worker.max(1),
@@ -199,6 +286,14 @@ impl CacheKey {
             script_hash: hasher.finish(),
         }
     }
+}
+
+/// Deterministic routing: the same cache key always reaches the same thread,
+/// so a script is compiled once instead of once per worker.
+fn route_worker(key: &CacheKey, workers: usize) -> usize {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() % workers as u64) as usize
 }
 
 /// Reusable equivalent of rquickjs' one-shot BuiltinLoader.
@@ -350,17 +445,47 @@ impl Worker {
         self.calls >= settings.max_calls_per_worker
     }
 
-    fn evict_lru(&mut self, max: usize) {
-        if self.cache.len() < max {
-            return;
+    /// Sum of QuickJS `memory_usage()` over every cached realm. This is the
+    /// accounting used for the per-thread budget (not the process RSS).
+    fn cache_bytes(&self) -> usize {
+        self.cache.values().fold(0usize, |acc, e| {
+            acc.saturating_add(e.rt.memory_usage().memory_used_size as usize)
+        })
+    }
+
+    fn remove_entry(&mut self, key: &CacheKey, reason: &str) {
+        if self.cache.remove(key).is_some() {
+            CODEC_CACHE_EVICTIONS
+                .get_or_create(&reason_labels(reason))
+                .inc();
         }
+    }
+
+    fn evict_oldest(&mut self, reason: &str) {
         let oldest = self
             .cache
             .iter()
             .min_by_key(|(_, e)| e.last_used)
             .map(|(k, _)| *k);
         if let Some(key) = oldest {
-            self.cache.remove(&key);
+            self.remove_entry(&key, reason);
+        }
+    }
+
+    fn evict_lru(&mut self, max: usize) {
+        if self.cache.len() >= max {
+            self.evict_oldest("lru");
+        }
+    }
+
+    /// Evict LRU realms until the sum of their real memory usage fits the
+    /// per-thread budget. `max_memory_bytes` remains the per-script ceiling.
+    fn enforce_budget(&mut self, budget: usize) {
+        if budget == 0 {
+            return;
+        }
+        while self.cache_bytes() > budget && !self.cache.is_empty() {
+            self.evict_oldest("budget");
         }
     }
 
@@ -390,11 +515,16 @@ impl Worker {
             Some(entry) => entry.script != script,
             None => true,
         };
+        if needs_compile {
+            CODEC_CACHE_MISSES.inc();
+        } else {
+            CODEC_CACHE_HITS.inc();
+        }
 
         if needs_compile {
             // A changed script under the same key must free its old realm
             // before the LRU bound is evaluated.
-            self.cache.remove(&key);
+            self.remove_entry(&key, "error");
             self.evict_lru(settings.max_cached_scripts);
             self.seq += 1;
             let module_name = format!("chirpstack-codec-{:016x}-{}", key.script_hash, self.seq);
@@ -502,8 +632,9 @@ impl Worker {
         // On error or memory pressure, drop ONLY this script's realm. Every
         // other tenant's realm on this thread stays alive and untouched.
         if out.is_err() || evict_entry {
-            self.cache.remove(&key);
+            self.remove_entry(&key, "error");
         }
+        self.enforce_budget(settings.max_cache_memory_bytes);
         out
     }
 }
@@ -681,36 +812,40 @@ enum JobOutput {
     Encode((u8, Vec<u8>)),
 }
 
-/// Enqueue without ever waiting: a full queue is a clean, observable error.
-fn submit(
+/// Enqueue with a BOUNDED wait. A burst is absorbed by the queue; rejection
+/// only happens at real saturation (the per-thread channel stayed full for
+/// `queue_wait_timeout`), and is a clean, observable error.
+async fn submit(
     pool: &CodecPool,
     job: Job,
     settings: JsSettings,
 ) -> Result<tokio::sync::oneshot::Receiver<Result<JobOutput>>> {
+    let key = CacheKey::new(job.identity(), job.script());
+    let index = route_worker(&key, pool.workers);
     let (reply, rx) = tokio::sync::oneshot::channel();
     let message = JobMessage {
         job,
         settings,
         reply,
     };
-    match pool.tx.try_send(message) {
-        Ok(()) => Ok(rx),
-        Err(mpsc::TrySendError::Full(_)) => {
+    match timeout(pool.queue_wait_timeout, pool.senders[index].send(message)).await {
+        Ok(Ok(())) => Ok(rx),
+        Ok(Err(_)) => Err(anyhow!("JS codec worker pool is unavailable")),
+        Err(_) => {
             CODEC_QUEUE_FULL_COUNTER.inc();
             Err(anyhow!(
-                "JS codec queue is full ({} workers, capacity {}); request rejected",
+                "JS codec queue saturated: waited {:?} for worker {index}/{} \
+                 (per-thread capacity {}); request rejected",
+                pool.queue_wait_timeout,
                 pool.workers,
                 pool.queue_capacity
             ))
-        }
-        Err(mpsc::TrySendError::Disconnected(_)) => {
-            Err(anyhow!("JS codec worker pool is unavailable"))
         }
     }
 }
 
 async fn execute_on(pool: &CodecPool, job: Job, settings: JsSettings) -> Result<JobOutput> {
-    let rx = submit(pool, job, settings)?;
+    let rx = submit(pool, job, settings).await?;
     rx.await
         .map_err(|e| anyhow!("JS codec worker dropped the reply: {}", e))?
 }
@@ -779,20 +914,26 @@ fn pooled_settings() -> JsSettings {
 }
 
 #[cfg(test)]
-fn test_pool(capacity: usize) -> CodecPool {
-    // A pool with a live receiver but NO worker threads: the queue fills and
-    // stays full, which makes the rejection path deterministic.
-    let (tx, rx) = mpsc::sync_channel::<JobMessage>(capacity);
-    CodecPool {
-        tx,
-        rx: Arc::new(Mutex::new(rx)),
-        workers: 1,
-        queue_capacity: capacity,
+fn test_pool(
+    workers: usize,
+    capacity: usize,
+    wait: Duration,
+    spawn_threads: bool,
+) -> (CodecPool, Vec<Receiver<JobMessage>>) {
+    let (pool, receivers) = CodecPool::channels(workers, capacity, wait);
+    if spawn_threads {
+        pool.spawn_threads(receivers);
+        (pool, Vec::new())
+    } else {
+        // Caller keeps the receivers alive: channels stay open but nobody
+        // consumes them, which is a deterministic saturated queue.
+        (pool, receivers)
     }
 }
 
 #[cfg(test)]
-async fn decode_with_settings(
+async fn decode_on(
+    pool: &CodecPool,
     identity: CodecIdentity,
     f_port: u8,
     script: &str,
@@ -808,10 +949,21 @@ async fn decode_with_settings(
         bytes: bytes.to_vec(),
         panic_probe: false,
     };
-    match execute_with_settings(job, settings).await? {
+    match execute_on(pool, job, settings).await? {
         JobOutput::Decode(v) => Ok(v),
         JobOutput::Encode(_) => Err(anyhow!("Unexpected JS codec output for decode")),
     }
+}
+
+#[cfg(test)]
+async fn decode_with_settings(
+    identity: CodecIdentity,
+    f_port: u8,
+    script: &str,
+    bytes: &[u8],
+    settings: JsSettings,
+) -> anyhow::Result<pbjson_types::Struct> {
+    decode_on(&CODEC_POOL, identity, f_port, script, bytes, settings).await
 }
 
 #[cfg(test)]
@@ -1674,18 +1826,172 @@ mod pool_test {
             .values()
             .map(|e| e.rt.memory_usage().memory_used_size as usize)
             .collect();
-        let total: usize = per_script.iter().sum();
-        let bound = settings.max_cached_scripts * settings.max_memory_bytes;
+        let total = worker.cache_bytes();
         println!(
-            "one thread: {} realms, {} bytes used, bound {} bytes \
-             (workers * max_cached_scripts * max_memory_bytes)",
+            "one thread: {} realms, {} bytes used, budget {} bytes \
+             (bound = workers * max_cache_memory_bytes)",
             worker.cache.len(),
             total,
-            bound
+            settings.max_cache_memory_bytes
         );
         assert_eq!(worker.cache.len(), settings.max_cached_scripts);
         assert!(per_script.iter().all(|v| *v < settings.max_memory_bytes));
-        assert!(total < bound);
+        assert!(total <= settings.max_cache_memory_bytes);
+    }
+
+    /// 2. The real per-thread budget evicts LRU realms even when the count is
+    /// still far below max_cached_scripts.
+    #[test]
+    fn budget_eviction_keeps_the_sum_under_the_per_thread_budget() {
+        let mut settings = pooled_settings();
+        settings.gc_every_calls = 0;
+        settings.max_cached_scripts = 64;
+        settings.max_cache_memory_bytes = 1024 * 1024; // 1 MiB
+        let script = "function decodeUplink(i) { return { data: { ok: 1 } }; }";
+        let mut worker = Worker::new();
+        let before = CODEC_CACHE_EVICTIONS
+            .get_or_create(&reason_labels("budget"))
+            .get();
+
+        for i in 0..20u128 {
+            worker
+                .run(decode_job(identity(1, i), 1, &[1], script), &settings)
+                .unwrap();
+        }
+
+        println!(
+            "budget eviction: {} realms left, {} bytes used (budget {})",
+            worker.cache.len(),
+            worker.cache_bytes(),
+            settings.max_cache_memory_bytes
+        );
+        assert!(worker.cache_bytes() <= settings.max_cache_memory_bytes);
+        assert!(worker.cache.len() < 20);
+        assert!(
+            CODEC_CACHE_EVICTIONS
+                .get_or_create(&reason_labels("budget"))
+                .get()
+                > before
+        );
+    }
+
+    /// 2. Every removal is observable: hits/misses and eviction reasons.
+    #[test]
+    fn cache_metrics_expose_hits_misses_and_eviction_reasons() {
+        let hits = CODEC_CACHE_HITS.get();
+        let misses = CODEC_CACHE_MISSES.get();
+        let lru = CODEC_CACHE_EVICTIONS
+            .get_or_create(&reason_labels("lru"))
+            .get();
+        let mut settings = pooled_settings();
+        settings.max_cached_scripts = 1;
+        settings.max_cache_memory_bytes = 0;
+        let script = "function decodeUplink(i) { return { data: { ok: 1 } }; }";
+        let mut worker = Worker::new();
+
+        worker
+            .run(decode_job(identity(1, 1), 1, &[1], script), &settings)
+            .unwrap(); // miss
+        worker
+            .run(decode_job(identity(1, 1), 2, &[1], script), &settings)
+            .unwrap(); // hit
+        worker
+            .run(decode_job(identity(1, 2), 1, &[1], script), &settings)
+            .unwrap(); // miss + LRU eviction
+
+        assert_eq!(CODEC_CACHE_HITS.get() - hits, 1);
+        assert_eq!(CODEC_CACHE_MISSES.get() - misses, 2);
+        assert!(
+            CODEC_CACHE_EVICTIONS
+                .get_or_create(&reason_labels("lru"))
+                .get()
+                > lru
+        );
+    }
+
+    /// 2. hash(key) % N is deterministic: one script is cached once.
+    #[tokio::test]
+    async fn routing_keeps_one_key_on_one_worker() {
+        let (pool, _receivers) = test_pool(2, 256, Duration::from_secs(1), true);
+        let settings = pooled_settings();
+        let script = "function decodeUplink(i) { return { data: { ok: 1 } }; }";
+        let wrapped = make_script(script, "decodeUplink");
+        let before: Vec<u64> = pool
+            .jobs_per_worker
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+
+        for port in 0..20u8 {
+            decode_on(&pool, identity(1, 1), port, script, &[1], settings.clone())
+                .await
+                .unwrap();
+        }
+
+        let after: Vec<u64> = pool
+            .jobs_per_worker
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+        let delta: Vec<u64> = after.iter().zip(&before).map(|(a, b)| a - b).collect();
+        assert_eq!(delta.iter().sum::<u64>(), 20);
+        assert!(
+            delta.iter().any(|v| *v == 20),
+            "all same-key jobs must land on ONE worker: {delta:?}"
+        );
+
+        // And a realistic mix of keys must reach both workers.
+        let mut seen = [false; 2];
+        for i in 0..100u128 {
+            let key = CacheKey::new(identity(1, i), &wrapped);
+            seen[route_worker(&key, 2)] = true;
+        }
+        assert_eq!(seen, [true, true], "hash routing must use both threads");
+    }
+
+    /// 3. After mem::forget, the OS thread is still alive and picks up a fresh
+    /// Worker (no lost thread => no lost capacity).
+    #[tokio::test]
+    async fn a_panic_does_not_kill_the_worker_thread() {
+        let (pool, _receivers) = test_pool(1, 256, Duration::from_secs(1), true);
+        let settings = pooled_settings();
+        let script = r#"
+            var counter = 0;
+            function decodeUplink(i) {
+                counter++;
+                return { data: { counter: counter } };
+            }
+        "#;
+        let jobs_before = pool.jobs_per_worker[0].load(Ordering::Relaxed);
+
+        let out = decode_on(&pool, identity(1, 1), 1, script, &[1], settings.clone())
+            .await
+            .unwrap();
+        assert_eq!(number(&out, "counter"), 1.0);
+
+        let panics_before = CODEC_PANIC_COUNTER.get();
+        let mut job = decode_job(identity(1, 1), 1, &[1], script);
+        if let Job::Decode { panic_probe, .. } = &mut job {
+            *panic_probe = true;
+        }
+        let err = execute_on(&pool, job, settings.clone())
+            .await
+            .expect_err("panic must produce a clean error");
+        assert!(err.to_string().contains("engine aborted"), "{err:#}");
+        assert_eq!(CODEC_PANIC_COUNTER.get(), panics_before + 1);
+
+        // Fresh Worker: module-level state starts from zero again, and the
+        // SAME thread keeps serving (its job counter keeps increasing).
+        for expected in [1.0, 2.0, 3.0] {
+            let out = decode_on(&pool, identity(1, 1), 1, script, &[1], settings.clone())
+                .await
+                .unwrap();
+            assert_eq!(number(&out, "counter"), expected);
+        }
+        assert!(
+            pool.jobs_per_worker[0].load(Ordering::Relaxed) >= jobs_before + 5,
+            "the worker thread must not have died"
+        );
     }
 
     #[test]
@@ -1776,9 +2082,13 @@ mod pool_test {
     }
 
     /// A: a bounded channel rejects instead of waiting forever.
-    #[test]
-    fn a_full_queue_is_rejected_without_waiting() {
-        let pool = test_pool(1);
+    /// A burst is absorbed by the bounded queue; only real saturation
+    /// (channel still full after queue_wait_timeout) produces a clean error.
+    #[tokio::test]
+    async fn real_queue_saturation_waits_then_rejects_cleanly() {
+        // No worker threads: the receiver is kept alive by `_receivers`, so the
+        // channel is open but nobody drains it -> deterministic saturation.
+        let (pool, _receivers) = test_pool(1, 1, Duration::from_millis(80), false);
         let job = decode_job(
             identity(1, 1),
             1,
@@ -1788,10 +2098,49 @@ mod pool_test {
         let settings = pooled_settings();
         let before = CODEC_QUEUE_FULL_COUNTER.get();
 
-        let _first = submit(&pool, job.clone(), settings.clone()).unwrap();
-        let err = submit(&pool, job, settings).expect_err("queue must be full");
-        assert!(err.to_string().contains("queue is full"), "{err:#}");
+        let _first = submit(&pool, job.clone(), settings.clone()).await.unwrap();
+        let start = Instant::now();
+        let err = submit(&pool, job, settings)
+            .await
+            .expect_err("saturated queue must be rejected");
+        let waited = start.elapsed();
+
+        assert!(err.to_string().contains("queue saturated"), "{err:#}");
+        assert!(
+            waited >= Duration::from_millis(50),
+            "the submit must actually WAIT before rejecting (waited {waited:?})"
+        );
         assert_eq!(CODEC_QUEUE_FULL_COUNTER.get(), before + 1);
+    }
+
+    /// 1. A legitimate burst of 200 simultaneous uplinks with workers=2 must
+    /// not lose a single frame to queue rejection.
+    #[tokio::test]
+    async fn a_burst_of_200_concurrent_decodes_is_not_rejected() {
+        use futures::future::join_all;
+
+        let (pool, _receivers) = test_pool(2, 256, Duration::from_secs(1), true);
+        let settings = pooled_settings();
+        let script = "function decodeUplink(i) { return { data: { ok: i.fPort } }; }";
+        let before = CODEC_QUEUE_FULL_COUNTER.get();
+
+        // Two realms -> both per-thread channels are exercised.
+        let jobs: Vec<_> = (0..200u16)
+            .map(|i| {
+                let id = identity(1, (i % 2) as u128);
+                decode_on(&pool, id, (i % 256) as u8, script, &[1], settings.clone())
+            })
+            .collect();
+        let results = join_all(jobs).await;
+        for (i, r) in results.into_iter().enumerate() {
+            let out = r.unwrap_or_else(|e| panic!("job {i} was rejected: {e:#}"));
+            assert_eq!(number(&out, "ok"), ((i % 256) as f64));
+        }
+        assert_eq!(
+            CODEC_QUEUE_FULL_COUNTER.get(),
+            before,
+            "0 rejection expected"
+        );
     }
 
     /// A: exactly N dedicated threads, not Tokio's 512-thread blocking pool.
@@ -1807,10 +2156,12 @@ mod pool_test {
         }
         .max(1);
         assert_eq!(CODEC_POOL.workers, expected);
+        assert_eq!(CODEC_POOL.senders.len(), expected, "one channel per thread");
+        assert_eq!(CODEC_POOL.jobs_per_worker.len(), expected);
         assert_eq!(
             CODEC_POOL.queue_capacity,
             if conf.codec.js.queue_capacity == 0 {
-                expected.saturating_mul(4).max(4)
+                256
             } else {
                 conf.codec.js.queue_capacity.max(1)
             }
@@ -1845,5 +2196,104 @@ mod pool_test {
                 start.elapsed() / 200
             );
         }
+    }
+    /// 2. Quantify the imbalance when one very active profile pins all jobs to
+    /// a single worker (hash routing is deterministic, not load-aware).
+    #[tokio::test]
+    #[ignore = "manual benchmark"]
+    async fn bench_routing_imbalance() {
+        use futures::future::join_all;
+
+        let (pool, _receivers) = test_pool(2, 256, Duration::from_secs(1), true);
+        let settings = pooled_settings();
+        let script = "function decodeUplink(i) { return { data: { ok: i.fPort } }; }";
+        let wrapped = make_script(script, "decodeUplink");
+
+        let mut keys: [Option<u128>; 2] = [None, None];
+        for i in 0..1000u128 {
+            let key = CacheKey::new(identity(1, i), &wrapped);
+            let w = route_worker(&key, 2);
+            if keys[w].is_none() {
+                keys[w] = Some(i);
+            }
+            if keys.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        let [Some(k0), Some(k1)] = keys else {
+            panic!("could not find a key for each worker");
+        };
+
+        // Warm both realms so the measurement only exercises cache hits.
+        decode_on(&pool, identity(1, k0), 1, script, &[1], settings.clone())
+            .await
+            .unwrap();
+        decode_on(&pool, identity(1, k1), 1, script, &[1], settings.clone())
+            .await
+            .unwrap();
+
+        let n = 200u32;
+        let before: Vec<u64> = pool
+            .jobs_per_worker
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+
+        let start = Instant::now();
+        let hot: Vec<_> = (0..n)
+            .map(|i| {
+                decode_on(
+                    &pool,
+                    identity(1, k0),
+                    (i % 256) as u8,
+                    script,
+                    &[1],
+                    settings.clone(),
+                )
+            })
+            .collect();
+        for r in join_all(hot).await {
+            r.unwrap();
+        }
+        let hot_time = start.elapsed();
+
+        let start = Instant::now();
+        let spread: Vec<_> = (0..n)
+            .map(|i| {
+                let k = if i % 2 == 0 { k0 } else { k1 };
+                decode_on(
+                    &pool,
+                    identity(1, k),
+                    (i % 256) as u8,
+                    script,
+                    &[1],
+                    settings.clone(),
+                )
+            })
+            .collect();
+        for r in join_all(spread).await {
+            r.unwrap();
+        }
+        let spread_time = start.elapsed();
+
+        let after: Vec<u64> = pool
+            .jobs_per_worker
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+        let delta: Vec<u64> = after.iter().zip(&before).map(|(a, b)| a - b).collect();
+        println!(
+            "[routing] hot key  x{n}: {hot_time:?} ({:?}/call)",
+            hot_time / n
+        );
+        println!(
+            "[routing] 2 keys   x{n}: {spread_time:?} ({:?}/call)",
+            spread_time / n
+        );
+        println!("[routing] jobs/worker: {delta:?}");
+        println!(
+            "[routing] hot/spread = {:.2}x",
+            hot_time.as_secs_f64() / spread_time.as_secs_f64()
+        );
     }
 }

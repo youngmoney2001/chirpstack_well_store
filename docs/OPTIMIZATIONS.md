@@ -719,6 +719,161 @@ cargo test --release --offline -q -j 1 -p chirpstack \
 - `make test` complet (PostgreSQL / Redis / Mosquitto) toujours indisponible
   dans ce bac à sable.
 
+## Ajustements de la revue de `9732223` — appliqués (2026-11-04)
+
+Trois ajustements demandés avant d'ouvrir la 2.2. **Aucun code de la piste 2.2
+n'a été modifié** ; la reconnaissance 2.2 fait l'objet d'un document séparé
+([`SECURITY-2.2-RECON.md`](SECURITY-2.2-RECON.md)).
+
+### 1. File d'attente : attente bornée, et devenir réel d'un uplink en échec
+
+#### 1.1 Que devient exactement un uplink dont le décodage échoue ?
+
+Chaîne d'appels (fichiers de l'amont, non modifiés par ce commit) :
+
+```
+uplink/mod.rs::_deduplicate_uplink        (Redis SADD/PEXPIRE/SET NX, 200 ms, SMEMBERS)
+  └─ uplink/mod.rs::handle_uplink        (meta gateway, frame log gateway)
+       └─ uplink/data.rs::Data::_handle
+            ├─ get_device_for_phy_payload  → device::get_for_phypayload_and_incr_f_cnt_up
+            │    └─ UPDATE ... WHERE f_cnt_up <= full_f_cnt   ← FCnt DÉJÀ consommé
+            ├─ … ADR / MAC commands / logs / uplink_history …
+            └─ send_uplink_event()
+                 └─ codec::binary_to_struct → js::decode → submit()
+```
+
+`send_uplink_event()` (`chirpstack/src/uplink/data.rs:906-997`) construit
+d'abord un `integration_pb::UplinkEvent` contenant **`data` = octets
+`FRMPayload` déchiffrés** et `object: None`. Si `binary_to_struct` renvoie une
+erreur — y compris `JS codec queue saturated: …` — la branche `Err(e)` :
+
+1. publie un **`integration::log_event`** de niveau `Error`, code
+   `LogCode::UplinkCodec`, avec la chaîne d'erreur complète et le
+   `deduplication_id` en contexte ;
+2. **n'interrompt pas le flux** : `pl.object` reste `None` et l'exécution
+   continue.
+
+Conséquences précises :
+
+| Question | Réponse |
+| --- | --- |
+| La trame est-elle perdue ? | **Non au niveau transport** : le `UplinkEvent` est bien publié (`integration::uplink_event`), avec les octets bruts `data` mais **sans objet décodé**. Les frame-logs (`log_uplink_frame_set`, `log_uplink_meta`, frame-log passerelles) ont déjà été écrits **avant** le décodage. |
+| Les intégrations sont-elles notifiées ? | **Oui**, deux fois : un `log_event` d'erreur `UplinkCodec` **et** un `uplink_event` dégradé (`object: None`). |
+| Les mesures sont-elles enregistrées ? | **Non.** `detect_and_save_measurements()` lit `up_event.object` ; avec `None`, `data_measurements` est vide : aucune écriture Redis de mesure, aucune auto-détection. |
+| L'état du device avance-t-il ? | **Oui.** `sync_uplink_f_cnt()` puis `update_device()` (`partial_update`, sans condition) écrivent `f_cnt_up = full+1` ; `handle_uplink_ack`, `save_metrics` et le flux downlink s'exécutent quand même. Le FCnt avait déjà été réservé par l'`UPDATE` conditionnel de `get_for_phypayload_and_incr_f_cnt_up`. |
+| Peut-on récupérer l'objet décodé ? | **Non.** Aucun retry, aucune file d'attente de reprise, aucun dead-letter. Rejouer la même trame dans les 400 ms du TTL de déduplication est absorbé par Redis ; après, le même FCnt est traité comme **retransmission** et `handle_retransmission_reset()` abandonne (sauf `skip_fcnt_check`). L'objet décodé est donc définitivement perdu. |
+| Observabilité | `codec_js_queue_full_total` + le `log_event` `UplinkCodec`. Aucune alerte n'est configurée par défaut. |
+
+Les autres appelants du codec ont un comportement différent : `api/device.rs:1148`
+et `integration/mod.rs:503` (`struct_to_binary`, downlink) **propagent** l'erreur
+à l'appelant (status gRPC / erreur d'intégration) et **ne créent pas** l'élément
+de file downlink.
+
+> C'est précisément pour éviter cette perte silencieuse qu'une rafale légitime ne
+> doit pas être rejetée : le rejet immédiat de `9732223` transformait une
+> saturation transitoire en **`object` absent + mesures absentes + FCnt
+> consommé**, sans possibilité de rejouer.
+
+#### 1.2 Attente bornée et capacité
+
+- `submit()` n'utilise plus `try_send()` immédiat :
+  `tokio::time::timeout(queue_wait_timeout, tx.send(message)).await`.
+  L'attente porte sur une **tâche async**, aucun thread n'est bloqué.
+- `[codec.js] queue_wait_timeout = "1s"` (nouveau). Le rejet n'intervient qu'en
+  **vraie saturation** (le canal est resté plein pendant tout le délai), avec
+  `codec_js_queue_full_total` et une erreur propre
+  `JS codec queue saturated: waited …; request rejected`.
+- `queue_capacity` passe d'un défaut `workers × 4` à **256 par thread** (0 =
+  auto). Avec le routage par hash (§2) il y a un canal par thread, donc
+  **N × 256 = 512** emplacements en attente pour N=2.
+- Tests : `a_burst_of_200_concurrent_decodes_is_not_rejected` (200 décodes
+  simultanés, workers=2, 2 clés → **0 rejet**, résultats corrects) et
+  `real_queue_saturation_waits_then_rejects_cleanly` (capacité 1, aucun
+  consommateur, attente 80 ms → le `submit` **attend réellement** ≥ 50 ms, puis
+  erreur propre + compteur incrémenté).
+
+### 2. Routage déterministe, budget réel et métriques
+
+- **Un canal par thread** (`Vec<Sender<JobMessage>>`) ; plus de
+  `Arc<Mutex<Receiver>>` partagé. Chaque job est routé par
+  `hash(CacheKey) % N` (`route_worker`), donc **un script n'est compilé et mis
+  en cache qu'une seule fois** dans le processus. Capacité réelle du cache :
+  **N × `max_cached_scripts`** = 2 × 64 = **128 realms** ici.
+- **Éviction sur budget réel** : `Worker::cache_bytes()` somme les
+  `Runtime::memory_usage().memory_used_size` de tous les realms du thread ;
+  `enforce_budget()` évince les LRU jusqu'à rentrer sous
+  `[codec.js] max_cache_memory_bytes` (**32 Mio** par thread, 0 = désactivé).
+  `max_memory_bytes` (4 Mio) reste le **plafond par script**. `max_cached_scripts`
+  remonte de 8 à **64**, le budget réel devenant la vraie limite.
+- **Nouvelle borne** : `N × max_cache_memory_bytes` = 2 × 32 Mio =
+  **64 Mio**, inchangée par rapport à `9732223`. Les 128 realms ne sont pas
+  additionnés à 4 Mio chacun : le budget réel plafonne la somme. Mesure d'un
+  cache plein : ~0,29 Mio par realm, soit ~18 Mio pour 64 realms sous 32 Mio.
+  > Limite : `memory_usage()` comptabilise le tas QuickJS, pas l'empreinte RSS
+  > complète (pthread, allocations Rust, bytecode). La borne est donc celle du
+  > tas JS, à majorer d'une marge process en production.
+- **Métriques Prometheus** ajoutées :
+  `codec_js_cache_hits_total`, `codec_js_cache_misses_total`,
+  `codec_js_cache_evictions_total{reason="lru"|"budget"|"error"}` et
+  `codec_js_jobs_by_worker_total{worker="0"|"1"|…}`. Test
+  `cache_metrics_expose_hits_misses_and_eviction_reasons`.
+- **Déséquilibre mesuré** (`bench_routing_imbalance`, ignoré, 200 appels, 2
+  workers) : un profil très actif épingle tous ses jobs sur un seul thread.
+
+| Profil | `--release` (3 runs) | debug |
+| --- | --- | --- |
+| 1 clé chaude | 86,6 / 128,2 / 145,0 µs par appel | 239,5 µs |
+| 2 clés réparties | 36,7 / 52,1 / 59,5 µs par appel | 166,8 µs |
+| Ratio hot / spread | **2,36× / 2,46× / 2,44×** | 1,44× |
+| `jobs_per_worker` | **[300, 100]** (3:1) | [300, 100] |
+
+Le routage par hash est déterministe et **non sensible à la charge** : c'est le
+prix de « un script = un realm ». Correctifs possibles, non implémentés (à
+arbitrer) : *least-loaded* avec duplication du realm (casse la garantie
+« compilé une fois »), *consistent hashing* à nœuds virtuels (réduit le
+déplacement de cache mais pas le déséquilibre d'une clé unique), ou
+répartition intra-clé par lots avec plusieurs realms identiques. La métrique
+`codec_js_jobs_by_worker_total` permet de détecter le cas en production.
+
+### 3. Après un panic : le thread continue
+
+`a_panic_does_not_kill_the_worker_thread` utilise un pool réel à 1 thread :
+décodage OK → job `panic_probe` → erreur `engine aborted` +
+`codec_js_panics_total` → **3 décodes suivants réussissent** avec un compteur
+de module remis à 1, 2, 3 (preuve du `Worker` neuf) et le compteur de jobs du
+thread a augmenté d'au moins 5 (preuve que le thread n'est pas mort).
+`mem::forget` n'entraîne donc **aucune perte de capacité**. La fuite mémoire
+cumulative des realms leakés reste documentée à la revue précédente :
+alerter sur `codec_js_panics_total`.
+
+### Validation
+
+- `rustfmt --check` OK ; `cargo clippy --offline -p chirpstack` 0 erreur / 0
+  warning nouveau ; `cargo check` postgres et sqlite OK.
+- `cargo test --offline -p chirpstack codec::js:: -- --test-threads=1` :
+  **38 passés / 0 échec / 4 ignorés** (8 amont + 30 pool/sécurité, 4 benchs
+  manuels ignorés) — **identique en `--release`** (1,31 s).
+- `chirpstack --config <DIR> configfile` : TOML valide, **12 options
+  `[codec.js]`** (`queue_wait_timeout="1s"`, `max_cache_memory_bytes=33554432`,
+  `max_cached_scripts=64`, `queue_capacity=0`).
+- `uplink::tests` 3/3 ; `Cargo.lock` inchangé.
+- Bench `--release` après routage : pool 171,7 µs/appel (`gc=1`), `gc=0`
+  122,8 µs, `cache_scripts=false` 5,07 ms, cache miss 6,01 ms.
+
+### Écarts avec les consignes
+
+| # | Consigne | Écart / choix |
+| --- | --- | --- |
+| 1 | « capacité plus large (ex. 256) » | `queue_capacity` est devenue **la capacité de CHAQUE canal** (un par thread), donc 256 × N = 512 emplacements pour N=2, pas 256 au total. Choix imposé par le routage par hash ; documenté dans le template de config. |
+| 2 | « attente bornée (ex. 1 s) » | Conforme (`queue_wait_timeout="1s"`). Le délai s'ajoute à la latence de l'uplink en cas de saturation et **n'est pas couvert** par `max_execution_time`, qui n'est armé que sur le thread worker. |
+| 3 | Métrique de rejet | Le nom `codec_js_queue_full_total` de `9732223` est conservé, mais il compte désormais les **timeouts d'attente bornée**, pas les `try_send` immédiats. |
+| 4 | « capacité réelle = N × max_cached_scripts » | Vraie pour le **nombre de realms** ; la mémoire, elle, est bornée par `N × max_cache_memory_bytes`. `max_cached_scripts=64` est donc un plafond de comptage, pas un budget mémoire. |
+| 5 | Budget réel | `memory_usage()` = tas QuickJS uniquement, pas le RSS process (voir §2). Borne à majorer en production. |
+| 6 | Déséquilibre | Le routage par hash crée un déséquilibre mesuré jusqu'à **×2,46** sur un profil chaud. Non corrigé : toute correction casserait « un script = un seul realm ». Observabilité ajoutée à la place. |
+| 7 | Métriques | `jobs_by_worker` supplémentaire (non demandée) pour rendre le déséquilibre mesurable ; `evictions_total` utilise une `Family` labelisée (`reason`), `Cargo.lock` inchangé. |
+| 8 | Panic | Confirmé sans modifier `run_slot` : le test passe par le vrai pool et le vrai thread, pas par un slot local. |
+
+
 ---
 
 ## Cartographie du chemin chaud
@@ -753,8 +908,8 @@ gateway backend (MQTT / UDP)
 
 | # | Piste | Fichier(s) | Impact attendu | Effort / risque |
 | --- | --- | --- | --- | --- |
-| 2.1 | ✅ **Appliquée + durcie** — pool de runtimes QuickJS, cache de scripts compilés, puis isolation par `Context`/tenant/profil, limites mémoire/stack, GC et recyclage, puis revue A/B/C : pool dédié de N threads, un Runtime par script, LRU, `mem::forget` sur panic, `max_script_bytes`, benchs `--release` (33 tests). Voir « Phase 2.1 », « Durcissement sécurité de la 2.1 » et « Revue A/B/C de 743c680 ». | `chirpstack/src/codec/js/mod.rs`, `codec/mod.rs`, `config.rs`, `cmd/configfile.rs`, 3 appelants | **Élevé**, ~×33–42 sur appels en cache | Fait |
-| 2.2 | Éviter `sessions.push(ds.clone())` pour chaque device candidat lors de la validation MIC : travailler par référence et ne cloner la session que sur succès. | `chirpstack/src/storage/device.rs` (~l. 347) | Moyen, proportionnel au nombre de devices partageant un DevAddr | Moyen |
+| 2.1 | ✅ **Appliquée + durcie + ajustée** — pool de runtimes QuickJS, cache de scripts compilés, isolation par `Context`/tenant/profil, limites mémoire/stack, GC et recyclage, revue A/B/C (pool dédié de N threads, un Runtime par script, `mem::forget`, `max_script_bytes`), puis attente bornée, routage par hash et budget mémoire réel (38 tests). Voir « Phase 2.1 », « Durcissement sécurité de la 2.1 » et « Revue A/B/C de 743c680 ». | `chirpstack/src/codec/js/mod.rs`, `codec/mod.rs`, `config.rs`, `cmd/configfile.rs`, 3 appelants | **Élevé**, ~×33–42 sur appels en cache | Fait |
+| 2.2 | 🔎 **Étape 1 faite, rapport seul** — abordée sous l'angle **sécurité** : chaîne de résolution (candidats DevAddr / sessions secondaires / MIC / FCnt 32 bits), menaces DoS-Rejeu-Concurrence-MIC temps constant, mesures CPU du MIC par nombre de candidats, 8 propositions classées et règles anti-rejeu pour tout cache de sessions. Voir [`SECURITY-2.2-RECON.md`](SECURITY-2.2-RECON.md). **Aucune implémentation.** | `storage/device.rs`, `uplink/data.rs`, `uplink/mod.rs`, `lrwn/src/phy_payload.rs` | Sécurité : rollback FCnt + DoS non authentifié | Recon. faite |
 | 2.3 | Réduire les allers-retours Redis de la déduplication / du verrou Class-A (regrouper en pipeline ou Lua). | `chirpstack/src/uplink/mod.rs`, `chirpstack/src/downlink/scheduler.rs` | Moyen sur réseau dense | Moyen / risque de régression sur la concurrence |
 | 2.4 | Ajouter des métriques de latence par étape du pipeline d'uplink (histogrammes Prometheus) pour mesurer avant/après au lieu d'estimer. | `chirpstack/src/monitoring/` | Indispensable pour valider 2.1–2.3 | Faible |
 | 2.5 | **Améliorations métier** (à définir) : codec / décodage spécifique aux puits, mesures de niveau & pompe, alertes, stockage long terme, intégration HTTP/MQTT dédiée, multi-tenant par site. | `chirpstack/src/codec/`, `integration/`, `api/`, migrations | Fonctionnel | À cadrer avec toi |

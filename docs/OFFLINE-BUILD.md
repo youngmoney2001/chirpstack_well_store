@@ -86,8 +86,8 @@ cargo check --offline -p chirpstack --no-default-features --features sqlite
 | `cargo clippy --offline -p chirpstack` | ✅ 0 erreur ; warnings préexistants de l'amont uniquement |
 | `cargo test --offline -p chirpstack --no-run` | ✅ binaire de test compilé (3 min 51) |
 | `cargo test --offline -p chirpstack uplink::tests -- --test-threads=1` | ✅ 3/3 tests des filtres d'uplink |
-| `cargo test --offline -p chirpstack codec::js:: -- --test-threads=1` | ✅ 33/33 tests du codec JS (8 amont + 25 pool/sécurité), 3 benchmarks ignorés |
-| `chirpstack --config <DIR> configfile` → parseur TOML | ✅ config générée valide (10 options `[codec.js]`) |
+| `cargo test --offline -p chirpstack codec::js:: -- --test-threads=1` | ✅ 38/38 tests du codec JS (8 amont + 30 pool/sécurité), 4 benchmarks ignorés |
+| `chirpstack --config <DIR> configfile` → parseur TOML | ✅ config générée valide (12 options `[codec.js]`) |
 | Binaire de test : `CARGO_INCREMENTAL=0 cargo test ... --no-run` | ✅ évite le `SIGKILL` du linker par l'OOM du bac à sable (3,8 Gio) |
 
 Les fichiers modifiés par nos optimisations ne produisent **aucun** warning ni

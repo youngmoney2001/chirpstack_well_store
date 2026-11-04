@@ -448,19 +448,26 @@ pub struct CodecJs {
     /// upstream-equivalent realm-per-call deployment.
     pub cache_scripts: bool,
     /// Maximum number of compiled scripts (and therefore JS realms) cached
-    /// per dedicated worker thread. This is a true LRU bound.
+    /// per dedicated worker thread. This is a true LRU bound. The per-thread
+    /// memory budget (below) may evict more realms than this count suggests.
     pub max_cached_scripts: usize,
     /// Number of dedicated OS threads running JS codecs. 0 = auto
     /// (std::thread::available_parallelism()). Set it explicitly on hosts with
-    /// many cores: total JS memory is
-    /// workers * max_cached_scripts * max_memory_bytes.
+    /// many cores: total JS memory is workers * max_cache_memory_bytes.
     pub workers: usize,
-    /// Maximum number of jobs waiting for a worker. 0 = auto (workers * 4).
-    /// A full queue rejects the job with a clean error instead of waiting.
+    /// Capacity of EACH per-thread bounded queue. 0 = auto (256).
+    /// Total queued jobs = workers * queue_capacity.
     pub queue_capacity: usize,
+    /// How long a submit waits for a free queue slot before rejecting. The
+    /// rejection only happens at real saturation, never on a short burst.
+    #[serde(with = "humantime_serde")]
+    pub queue_wait_timeout: Duration,
     /// Maximum size of the generated script (user codec + wrapper) in bytes.
     /// Bounds parser/compiler work before any interrupt deadline is armed.
     pub max_script_bytes: usize,
+    /// Real per-thread budget: sum of QuickJS `memory_usage()` over all cached
+    /// realms. 0 = disabled. Total JS memory <= workers * this value.
+    pub max_cache_memory_bytes: usize,
     /// Hard QuickJS memory limit PER SCRIPT (one Runtime per cache entry).
     /// 0 = unlimited (not recommended).
     pub max_memory_bytes: usize,
@@ -478,11 +485,14 @@ impl Default for CodecJs {
         CodecJs {
             max_execution_time: Duration::from_millis(100),
             cache_scripts: true,
-            // Bound: workers * 8 * 4 MiB = 32 MiB per worker thread.
-            max_cached_scripts: 8,
+            // Bound: workers * 32 MiB = 64 MiB on a 2-core host. A realm costs
+            // ~0.29 MiB, so 64 realms (~18 MiB) fit inside the 32 MiB budget.
+            max_cached_scripts: 64,
             workers: 0,
-            queue_capacity: 0,
+            queue_capacity: 0, // -> 256 per thread
+            queue_wait_timeout: Duration::from_secs(1),
             max_script_bytes: 256 * 1024,
+            max_cache_memory_bytes: 32 * 1024 * 1024,
             max_memory_bytes: 4 * 1024 * 1024,
             max_stack_bytes: 512 * 1024,
             max_calls_per_worker: 10_000,
